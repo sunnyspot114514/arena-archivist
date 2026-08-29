@@ -132,6 +132,66 @@ type OpenAiCompatibleResponse = {
   error?: { message?: string };
 };
 
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(child);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function frozenJsonRecord(
+  value: Readonly<Record<string, unknown>> | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  if (value === undefined) return undefined;
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new Error('Model route additional body must be JSON serializable');
+  }
+  const clone: unknown = JSON.parse(serialized);
+  if (!clone || Array.isArray(clone) || typeof clone !== 'object') {
+    throw new Error('Model route additional body must be a JSON object');
+  }
+  return deepFreeze(clone as Record<string, unknown>);
+}
+
+function snapshotRoute(route: ProviderRoute): ProviderRoute {
+  const {
+    id,
+    provider,
+    kind,
+    baseUrl,
+    model,
+    connectionId,
+    allowedTasks,
+    zeroDataRetention,
+    promptLogging,
+    enabled,
+    additionalHeaders,
+    additionalBody,
+  } = route;
+  return Object.freeze({
+    id,
+    provider,
+    kind,
+    baseUrl,
+    model,
+    connectionId,
+    allowedTasks: Object.freeze([...allowedTasks]),
+    zeroDataRetention,
+    promptLogging,
+    enabled,
+    ...(additionalHeaders === undefined
+      ? {}
+      : { additionalHeaders: Object.freeze({ ...additionalHeaders }) }),
+    ...(additionalBody === undefined
+      ? {}
+      : { additionalBody: frozenJsonRecord(additionalBody) }),
+  });
+}
+
 export class ModelRouter {
   readonly #routes: ReadonlyMap<string, ProviderRoute>;
   readonly #auth: AuthBroker & CredentialExecutor;
@@ -149,7 +209,13 @@ export class ModelRouter {
       'max_tokens',
       'response_format',
     ]);
-    for (const route of options.routes) {
+    const routes = options.routes.map(snapshotRoute);
+    const routeIds = new Set<string>();
+    for (const route of routes) {
+      if (routeIds.has(route.id)) {
+        throw new Error(`Duplicate model route: ${route.id}`);
+      }
+      routeIds.add(route.id);
       for (const key of Object.keys(route.additionalBody ?? {})) {
         if (protectedBodyKeys.has(key)) {
           throw new Error(
@@ -165,7 +231,7 @@ export class ModelRouter {
         }
       }
     }
-    this.#routes = new Map(options.routes.map((route) => [route.id, route]));
+    this.#routes = new Map(routes.map((route) => [route.id, route]));
     this.#auth = options.auth;
     this.#fetch = options.fetchImpl ?? fetch;
   }
@@ -177,12 +243,20 @@ export class ModelRouter {
   }
 
   async complete(request: CompletionRequest): Promise<CompletionResult> {
-    const route = this.#routes.get(request.routeId);
+    const {
+      task,
+      routeId,
+      projection,
+      temperature,
+      maxTokens,
+      responseFormat,
+    } = request;
+    const route = this.#routes.get(routeId);
     if (!route) {
-      throw new Error(`Unknown model route: ${request.routeId}`);
+      throw new Error(`Unknown model route: ${routeId}`);
     }
 
-    const decision = authorizeRoute(route, request);
+    const decision = authorizeRoute(route, { task, projection });
     if (!decision.allowed) {
       throw new Error(`Model route denied: ${decision.reason}`);
     }
@@ -204,11 +278,11 @@ export class ModelRouter {
           body: JSON.stringify({
             ...route.additionalBody,
             model: route.model,
-            messages: projectionMessages(request.projection),
-            temperature: request.temperature ?? 0,
-            max_tokens: request.maxTokens,
+            messages: projectionMessages(projection),
+            temperature: temperature ?? 0,
+            max_tokens: maxTokens,
             response_format:
-              request.responseFormat === 'json_object'
+              responseFormat === 'json_object'
                 ? { type: 'json_object' }
                 : undefined,
           }),

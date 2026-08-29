@@ -4,11 +4,44 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { ArenaRuntimeController } from '../src/controller';
+import {
+  ArenaRuntimeController,
+  classifyWorkerSettlement,
+} from '../src/controller';
 import { loadRuntimeConfig } from '../src/config';
 import { ArchiveStore } from '../../../packages/archive-store/index';
 
 describe('offline runtime lifecycle', () => {
+  it('classifies archive persistence failures as failed ledger outcomes', () => {
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'archive_failed',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: ['COMMIT'],
+      }),
+    ).toEqual({ status: 'failed', terminalPhase: 'failed' });
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'user_paused',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: [],
+      }),
+    ).toEqual({ status: 'stopped', terminalPhase: 'cancelled' });
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'runtime_shutdown',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: [],
+      }),
+    ).toEqual({ status: 'stopped', terminalPhase: 'cancelled' });
+  });
+
   it('uses the registered connector and completes the durable action ledger', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'arena-runtime-demo-'));
     let controller: ArenaRuntimeController | null = null;
@@ -50,9 +83,23 @@ describe('offline runtime lifecycle', () => {
       const actionId = status.run?.actionId;
       if (!actionId) throw new Error('action id missing');
       const detail = controller.readAction(actionId) as {
+        authorization: {
+          actionId: string;
+          connectorId: string;
+          source: string;
+          authorizationHash: string;
+        };
         events: Array<{ phase: string }>;
         recordCommits: Array<{ actionId: string; recordId: string }>;
       };
+      expect(detail.authorization).toEqual(
+        expect.objectContaining({
+          actionId,
+          connectorId: 'gray-swan',
+          source: 'loopback_http_policy',
+          authorizationHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        }),
+      );
       expect(detail.events.map((event) => event.phase)).toEqual([
         'proposal',
         'validation',
@@ -67,6 +114,25 @@ describe('offline runtime lifecycle', () => {
         detail.recordCommits.every((commit) => commit.actionId === actionId),
       ).toBe(true);
       expect(controller.queryRecords({ limit: 10 }).items).toHaveLength(2);
+
+      await controller.startSync({ maxRecords: 2, source: 'demo' });
+      let replay = await controller.status();
+      for (
+        let attempt = 0;
+        attempt < 100 && replay.run?.state === 'running';
+        attempt += 1
+      ) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+        replay = await controller.status();
+      }
+      expect(replay.run).toEqual(
+        expect.objectContaining({
+          state: 'completed',
+          actionPhase: 'canonical_commit',
+          committed: 0,
+          skippedKnown: 2,
+        }),
+      );
     } finally {
       if (controller) await controller.close();
       rmSync(directory, {

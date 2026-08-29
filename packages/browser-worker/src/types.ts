@@ -132,6 +132,7 @@ export type WorkerStopReason =
   | 'run_budget_exhausted'
   | 'run_time_exhausted'
   | 'navigation_failed'
+  | 'runtime_shutdown'
   | 'user_paused';
 
 export interface WorkerRunResult {

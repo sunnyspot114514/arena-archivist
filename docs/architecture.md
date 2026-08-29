@@ -53,11 +53,11 @@ proposal → validation → authorization → dispatch → observation
 any non-terminal phase → blocked | failed | cancelled
 ```
 
-`action_ledger_events` is append-only and sequences events by `(action_id, sequence)`. Every event also carries `sync_run_id`, input hash, payload hash, connector ID/version, and policy version. `action_ledger_actions` is a current-state index; it is not a replacement for the event history.
+`action_ledger_events` is append-only and sequences events by `(action_id, sequence)`. Every event also carries `sync_run_id`, input hash, payload hash, connector ID/version, and policy version. `action_authorizations` is a separate append-only grant: its authorization hash binds action/run, request hash, locally derived scope hash, policy and connector identity, principal/source/decision, and authorization time. Dispatch, successful settlement, and canonical record writes revalidate that row against the action; upgraded legacy actions without a v4 binding can only enter a non-success terminal (`blocked`, `failed`, or `cancelled`). The action row persists only an allowlisted request summary; arbitrary request bodies are hashed in memory and never stored. `action_ledger_actions` is a current-state index, not a replacement for either append-only history.
 
 On a successful run, observation, reconciliation, canonical action commit, and the terminal `sync_runs` update are written in one SQLite transaction. A stopped or failed run writes its explicit terminal action phase with the run terminal state. Startup recovery marks a formerly running action failed with `process_restarted` rather than blindly redispatching it.
 
-Individual records are still committed as they pass worker validation. Each record, its evidence references, `sync_record_commits` run/action link, run counter, and checkpoint advance form one atomic canonical-record transaction. Successful reconciliation requires the worker count, SQLite run counter, and linked non-unchanged record set to agree; the ledger stores a deterministic `recordSetHash` and `commitSetHash`. A mismatch rolls back observation/reconciliation and is settled as a failed action. The run-level `canonical_commit` attests that the resulting batch was observed and reconciled; it does not postpone already durable per-record commits.
+Individual records are still committed as they pass worker validation. An authorized run can enter this canonical transaction only while its action is in `dispatch`. Each record, its evidence references, append-only `sync_record_commits` run/action link, run counter, and checkpoint advance form one atomic canonical-record transaction. Successful reconciliation requires the worker count, SQLite run counter, and linked non-unchanged record set to agree; the ledger stores a deterministic `recordSetHash` and `commitSetHash`. A mismatch rolls back observation/reconciliation and is settled as a failed action. The run-level `canonical_commit` attests that the resulting batch was observed and reconciled; it does not postpone already durable per-record commits.
 
 ## Canonical data and recovery
 
@@ -80,15 +80,15 @@ If capture or parsing fails before `commitRecord`, no checkpoint advances. If a 
 
 Browsing and archival do not require an LLM. A provider request can only carry an `AuthorizedModelProjection` produced locally from a stored record:
 
-- the payload is a fixed allowlist of record summary, messages, judge results, selected attributes, and hash-only provenance;
-- email, phone, credential/token, private-key, and URL patterns are deterministically replaced;
-- remote IDs, source URLs, selector traces, evidence paths, and artifact metadata are omitted;
-- the projection carries `sourceHash`, `policyVersion`, and `projectionHash`;
+- the provider payload is a fixed allowlist of record summary, messages, judge results, selected attributes, and an explicit allowed/removed sensitivity-class manifest;
+- email, phone, quoted/unquoted credential/token, private-key, and URL patterns are deterministically replaced; structured display roles/judge names use source-scoped stable pseudonyms;
+- remote IDs, source URLs, selector/parser provenance, evidence paths, attachment names, and artifact metadata/hashes are omitted from provider content;
+- the local authorization envelope carries deterministic `projectionId`, `sourceRecordId`, `sourceHash`, an explicit payload `contentHash`, `policyVersion`, and `projectionHash`;
 - authorization carries the stored data policy plus `policyHash` and `authorizationHash`;
-- the generator requires a deep-frozen, module-branded attestation read from the current `ArchiveStore`; plain caller-authored records are rejected;
+- the generator requires a deep-frozen, module-branded attestation read from an open `ArchiveStore`; catalog identity/generation and current source/policy fields are revalidated at generation and provider dispatch, so policy/catalog changes revoke old objects;
 - a second module-private projection brand and hash recomputation reject serialized, cloned, tampered, or caller-authored projections.
 
-The model router no longer accepts caller messages, a caller-supplied record policy, or `redacted: true`. It builds a fixed instruction and serialized verified projection itself, then applies `local_only`, external-processing, embargo, direct-provider, and ZDR/logging gates.
+The model router no longer accepts caller messages, a caller-supplied record policy, or `redacted: true`. It snapshots the request once, and constructor-time validated provider routes are JSON-copied and deeply frozen before use. It validates the full local envelope, then serializes only its minimized payload beside a fixed instruction; projection/auth hashes and local authorization policy are not sent as model content. It then applies `local_only`, external-processing, embargo, direct-provider, and ZDR/logging gates against the same immutable projection/route later used for dispatch.
 
 ## Model-facing tools and local API
 

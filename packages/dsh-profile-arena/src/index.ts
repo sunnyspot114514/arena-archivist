@@ -175,7 +175,10 @@ export function toProjectionReceipt(
     !record ||
     !authorization ||
     receipt.contentReleased !== false ||
+    typeof receipt.projectionId !== 'string' ||
+    typeof receipt.sourceRecordId !== 'string' ||
     typeof receipt.sourceHash !== 'string' ||
+    typeof receipt.contentHash !== 'string' ||
     typeof receipt.projectionHash !== 'string'
   ) {
     throw new Error('Runtime returned an invalid projection receipt');
@@ -183,8 +186,11 @@ export function toProjectionReceipt(
   return {
     projectionReceipt: {
       kind: 'authorized_model_projection_receipt',
+      projectionId: receipt.projectionId,
+      sourceRecordId: receipt.sourceRecordId,
       sourceHash: receipt.sourceHash,
       policyVersion: stringOrNull(receipt.policyVersion),
+      contentHash: receipt.contentHash,
       projectionHash: receipt.projectionHash,
       record: {
         id: stringOrNull(record.id),

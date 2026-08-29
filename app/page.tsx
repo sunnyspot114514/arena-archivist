@@ -458,7 +458,7 @@ export default function Home() {
                 </CardTitle>
                 <CardDescription>
                   通过稳定 keyset
-                  查询读取本地记录句柄；模型读取时另行生成确定性脱敏投影。
+                  查询读取本地记录句柄；模型语义工具只返回无正文投影收据，完整确定性投影仅在本地路由边界生成。
                 </CardDescription>
                 <CardAction>
                   <Badge variant="outline" className="font-mono text-[10px]">

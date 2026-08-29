@@ -12,6 +12,7 @@ import type {
 import { createSanitizedEvidence } from './evidence.js';
 import { InMemoryDailyRunBudget } from './run-budget.js';
 import type {
+  ArchiveCommitResult,
   ArchivePort,
   AuditPort,
   CollectBrowserPort,
@@ -62,6 +63,13 @@ function policyStopReason(
     decision.reason === 'cross_origin_document'
     ? 'origin_denied'
     : 'unexpected_mutation';
+}
+
+function abortStopReason(signal?: AbortSignal): WorkerStopReason {
+  const reason = signal?.reason;
+  return reason instanceof Error && reason.message === 'runtime_shutdown'
+    ? 'runtime_shutdown'
+    : 'user_paused';
 }
 
 export class GraySwanBrowserWorker {
@@ -213,17 +221,23 @@ export class GraySwanBrowserWorker {
     if (!Number.isInteger(input.maxRecords) || input.maxRecords < 1) {
       throw new Error('maxRecords must be a positive integer');
     }
-    if (input.signal?.aborted) return this.stop('user_paused', counters);
+    if (input.signal?.aborted) {
+      return this.stop(abortStopReason(input.signal), counters);
+    }
     const recordLimit = Math.min(input.maxRecords, this.maximumRecords);
     const startedAt = this.now().getTime();
     if (!(await this.runBudget.tryStart(this.now())))
       return this.stop('run_budget_exhausted', counters);
 
-    if (!(await this.enter('AUTH_CHECK', input.signal)))
-      return this.stop('user_paused', counters);
+    if (!(await this.enter('AUTH_CHECK', input.signal))) {
+      return this.stop(abortStopReason(input.signal), counters);
+    }
     try {
       await this.dependencies.browser.navigate(this.config.indexUrl);
     } catch {
+      if (input.signal?.aborted) {
+        return this.stop(abortStopReason(input.signal), counters);
+      }
       const policy = await this.policyStop(counters);
       return policy ?? this.stop('navigation_failed', counters);
     }
@@ -234,13 +248,17 @@ export class GraySwanBrowserWorker {
     try {
       indexSnapshot = await this.dependencies.browser.snapshot();
     } catch {
+      if (input.signal?.aborted) {
+        return this.stop(abortStopReason(input.signal), counters);
+      }
       return this.stop('navigation_failed', counters);
     }
     const authBlocker = this.blockingStop(indexSnapshot);
     if (authBlocker) return this.stop(authBlocker, counters);
 
-    if (!(await this.enter('INDEX_DISCOVERY', input.signal)))
-      return this.stop('user_paused', counters);
+    if (!(await this.enter('INDEX_DISCOVERY', input.signal))) {
+      return this.stop(abortStopReason(input.signal), counters);
+    }
     const parsedIndex = parseIndexSnapshot(
       indexSnapshot,
       this.dependencies.selectorContract,
@@ -248,7 +266,9 @@ export class GraySwanBrowserWorker {
     if (!parsedIndex.ok) return this.stop('parser_mismatch', counters);
 
     for (const entry of parsedIndex.value.records) {
-      if (input.signal?.aborted) return this.stop('user_paused', counters);
+      if (input.signal?.aborted) {
+        return this.stop(abortStopReason(input.signal), counters);
+      }
       if (counters.committed >= recordLimit) break;
       if (this.now().getTime() - startedAt >= this.maximumRunMs) {
         return this.stop('run_time_exhausted', counters);
@@ -261,6 +281,9 @@ export class GraySwanBrowserWorker {
           entry.externalId,
         );
       } catch {
+        if (input.signal?.aborted) {
+          return this.stop(abortStopReason(input.signal), counters);
+        }
         return this.stop('archive_failed', counters);
       }
       if (known) {
@@ -272,11 +295,14 @@ export class GraySwanBrowserWorker {
       if (!recordUrl) return this.stop('origin_denied', counters);
 
       if (!(await this.enter('OPEN_RECORD', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
       try {
         await this.dependencies.browser.navigate(recordUrl);
       } catch {
+        if (input.signal?.aborted) {
+          return this.stop(abortStopReason(input.signal), counters);
+        }
         const policy = await this.policyStop(counters);
         return policy ?? this.stop('navigation_failed', counters);
       }
@@ -284,12 +310,15 @@ export class GraySwanBrowserWorker {
       if (openPolicyStop) return openPolicyStop;
 
       if (!(await this.enter('CAPTURE_RAW', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
       let rawSnapshot: RawPageSnapshot;
       try {
         rawSnapshot = await this.dependencies.browser.snapshot();
       } catch {
+        if (input.signal?.aborted) {
+          return this.stop(abortStopReason(input.signal), counters);
+        }
         return this.stop('navigation_failed', counters);
       }
       const capturePolicyStop = await this.policyStop(counters);
@@ -299,7 +328,7 @@ export class GraySwanBrowserWorker {
       const evidence = createSanitizedEvidence(rawSnapshot);
 
       if (!(await this.enter('PARSE', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
       const parsedRecord = parseRecordSnapshot(
         evidence.snapshot,
@@ -309,7 +338,7 @@ export class GraySwanBrowserWorker {
       if (!parsedRecord.ok) return this.stop('parser_mismatch', counters);
 
       if (!(await this.enter('VALIDATE', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
       const validated = validateParsedRecord(
         parsedRecord.value,
@@ -318,12 +347,13 @@ export class GraySwanBrowserWorker {
       if (!validated.ok) return this.stop('validation_failed', counters);
 
       if (!(await this.enter('COMMIT', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
+      let commitResult: ArchiveCommitResult;
       try {
         // The archive port has no independent checkpoint method: canonical data, evidence, and
         // cursor must commit in one store transaction or all roll back (invariant I5).
-        await this.dependencies.archive.commitRecord({
+        commitResult = await this.dependencies.archive.commitRecord({
           record: validated.value,
           evidence,
           checkpoint: {
@@ -338,20 +368,28 @@ export class GraySwanBrowserWorker {
           },
         });
       } catch {
+        if (input.signal?.aborted) {
+          return this.stop(abortStopReason(input.signal), counters);
+        }
         return this.stop('archive_failed', counters);
       }
-      counters.committed += 1;
-      await this.dependencies.audit?.write({
-        at: this.now().toISOString(),
-        type: 'record_committed',
-        externalId: entry.externalId,
-      });
+      if (commitResult.committed) {
+        counters.committed += 1;
+        await this.dependencies.audit?.write({
+          at: this.now().toISOString(),
+          type: 'record_committed',
+          externalId: entry.externalId,
+        });
+      } else {
+        counters.skippedKnown += 1;
+      }
 
       if (!(await this.enter('COOLDOWN', input.signal, entry.externalId))) {
-        return this.stop('user_paused', counters);
+        return this.stop(abortStopReason(input.signal), counters);
       }
-      if (!(await this.waitForCooldown(input.signal)))
-        return this.stop('user_paused', counters);
+      if (!(await this.waitForCooldown(input.signal))) {
+        return this.stop(abortStopReason(input.signal), counters);
+      }
     }
 
     return this.result('completed', counters, null);

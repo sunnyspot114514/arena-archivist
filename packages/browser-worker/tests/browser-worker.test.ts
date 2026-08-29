@@ -237,6 +237,50 @@ void test('checkpoint never advances when commit fails', async () => {
   assert.equal(durableState.checkpoint, null);
 });
 
+void test('unchanged atomic commits do not inflate the reconciled commit count', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  let commitCalls = 0;
+  const committedEvents: string[] = [];
+  const archive: ArchivePort = {
+    hasRecord: async () => false,
+    commitRecord: async (input) => {
+      commitCalls += 1;
+      return {
+        committed: false,
+        canonicalRecordId: `${input.record.kind}:${input.record.externalId}`,
+      };
+    },
+  };
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser: await fixtureBrowser(),
+      archive,
+      selectorContract: contract,
+      now: fixedNow,
+      audit: {
+        write: (event) => {
+          if (event.type === 'record_committed' && event.externalId) {
+            committedEvents.push(event.externalId);
+          }
+        },
+      },
+    },
+  );
+
+  const result = await worker.runNextBatch({ maxRecords: 1 });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.committed, 0);
+  assert.equal(result.skippedKnown, 2);
+  assert.equal(commitCalls, 2);
+  assert.deepEqual(committedEvents, []);
+});
+
 void test('AbortSignal cooperatively pauses an active batch during cooldown', async () => {
   const contract = await loadSelectorContract(
     resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
@@ -269,6 +313,34 @@ void test('AbortSignal cooperatively pauses an active batch during cooldown', as
   assert.equal(archive.records.size, 1);
   assert.equal(archive.checkpoints.length, 1);
   assert.equal(result.visitedStates.at(-1), 'COOLDOWN');
+});
+
+void test('a runtime shutdown abort keeps its durable cancellation reason', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  const controller = new AbortController();
+  controller.abort(new Error('runtime_shutdown'));
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser: await fixtureBrowser(),
+      archive: new MemoryArchive(),
+      selectorContract: contract,
+      now: fixedNow,
+    },
+  );
+
+  const result = await worker.runNextBatch({
+    maxRecords: 1,
+    signal: controller.signal,
+  });
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.stopReason, 'runtime_shutdown');
+  assert.equal(result.committed, 0);
 });
 
 void test('login fixture pauses at AUTH_CHECK', async () => {

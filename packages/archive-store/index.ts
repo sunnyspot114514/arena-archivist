@@ -310,6 +310,7 @@ export interface AuthorizedSyncRunInput extends SyncRunInput {
   request: Record<string, JsonValue>;
   authorization: {
     principal: string;
+    source?: string;
     decisionCode: string;
     scopeHash?: string;
   };
@@ -326,7 +327,7 @@ export interface StoredActionLedgerAction {
   policyVersion: string;
   connectorId: string;
   connectorVersion: string;
-  request: Record<string, JsonValue>;
+  requestSummary: Record<string, JsonValue>;
   context: Record<string, JsonValue>;
   terminal: boolean;
   createdAt: string;
@@ -347,6 +348,22 @@ export interface StoredActionLedgerEvent {
   connectorVersion: string;
   payloadHash: string;
   payload: Record<string, JsonValue>;
+}
+
+export interface StoredActionAuthorization {
+  authorizationId: string;
+  actionId: string;
+  syncRunId: string;
+  requestHash: string;
+  scopeHash: string;
+  policyVersion: string;
+  connectorId: string;
+  connectorVersion: string;
+  principal: string;
+  source: string;
+  decisionCode: string;
+  authorizedAt: string;
+  authorizationHash: string;
 }
 
 export interface StoredSyncRecordCommit {
@@ -732,6 +749,98 @@ const MIGRATIONS: readonly Migration[] = [
       END;
     `,
   },
+  {
+    version: 4,
+    name: 'authorization_binding_and_request_minimization',
+    sql: `
+      UPDATE action_ledger_actions SET request_json = '{}';
+
+      CREATE TABLE action_authorizations (
+        authorization_id TEXT PRIMARY KEY,
+        action_id TEXT NOT NULL UNIQUE,
+        sync_run_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        scope_hash TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        connector_version TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        source TEXT NOT NULL,
+        decision_code TEXT NOT NULL,
+        authorized_at TEXT NOT NULL,
+        authorization_hash TEXT NOT NULL UNIQUE,
+        FOREIGN KEY (action_id, sync_run_id)
+          REFERENCES action_ledger_actions(action_id, sync_run_id) ON DELETE RESTRICT
+      ) STRICT;
+
+      CREATE INDEX action_authorizations_run_idx
+        ON action_authorizations(sync_run_id, authorized_at);
+
+      CREATE TRIGGER action_authorizations_append_only_update
+      BEFORE UPDATE ON action_authorizations
+      BEGIN
+        SELECT RAISE(ABORT, 'action authorizations are append-only');
+      END;
+
+      CREATE TRIGGER action_authorizations_append_only_delete
+      BEFORE DELETE ON action_authorizations
+      BEGIN
+        SELECT RAISE(ABORT, 'action authorizations are append-only');
+      END;
+
+      CREATE TRIGGER sync_record_commits_action_run_match
+      BEFORE INSERT ON sync_record_commits
+      WHEN NEW.action_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM action_ledger_actions
+        WHERE action_id = NEW.action_id AND sync_run_id = NEW.sync_run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'record commit action/run mismatch');
+      END;
+
+      CREATE TRIGGER sync_record_commits_append_only_update
+      BEFORE UPDATE ON sync_record_commits
+      BEGIN
+        SELECT RAISE(ABORT, 'sync record commits are append-only');
+      END;
+
+      CREATE TRIGGER sync_record_commits_append_only_delete
+      BEFORE DELETE ON sync_record_commits
+      BEGIN
+        SELECT RAISE(ABORT, 'sync record commits are append-only');
+      END;
+    `,
+  },
+  {
+    version: 5,
+    name: 'authorization_execution_hardening',
+    sql: `
+      CREATE TRIGGER action_authorizations_action_binding
+      BEFORE INSERT ON action_authorizations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM action_ledger_actions
+        WHERE action_id = NEW.action_id
+          AND sync_run_id = NEW.sync_run_id
+          AND input_hash = NEW.request_hash
+          AND policy_version = NEW.policy_version
+          AND connector_id = NEW.connector_id
+          AND connector_version = NEW.connector_version
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'authorization/action binding mismatch');
+      END;
+
+      CREATE TRIGGER sync_record_commits_authorization_required
+      BEFORE INSERT ON sync_record_commits
+      WHEN NEW.action_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM action_authorizations
+        WHERE action_id = NEW.action_id AND sync_run_id = NEW.sync_run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'record commit requires bound authorization');
+      END;
+    `,
+  },
 ];
 
 const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]?.version ?? 0;
@@ -898,6 +1007,30 @@ export function hashCanonicalJson(
   return hashRawEvidence(json(value));
 }
 
+function actionRequestSummary(
+  request: Record<string, JsonValue>,
+): Record<string, JsonValue> {
+  const summary: Record<string, JsonValue> = {};
+  if (
+    typeof request.operation === 'string' &&
+    /^[a-z0-9._-]{1,64}$/.test(request.operation)
+  ) {
+    summary.operation = request.operation;
+  }
+  if (request.source === 'demo' || request.source === 'live') {
+    summary.source = request.source;
+  }
+  if (
+    typeof request.maxRecords === 'number' &&
+    Number.isSafeInteger(request.maxRecords) &&
+    request.maxRecords >= 1 &&
+    request.maxRecords <= 500
+  ) {
+    summary.maxRecords = request.maxRecords;
+  }
+  return summary;
+}
+
 const ACTION_PHASES = new Set<ActionLedgerPhase>([
   'proposal',
   'validation',
@@ -1000,7 +1133,7 @@ function decodeRecordCursor(value: string): RecordQueryCursor {
   }
 }
 
-const localArchiveAttestations = new WeakSet<object>();
+const localArchiveAttestations = new WeakMap<object, () => boolean>();
 
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -1031,10 +1164,12 @@ function archiveAttestationHash(input: {
 export function isLocallyAttestedArchiveRecord(
   attestation: AttestedArchiveRecord,
 ): boolean {
+  const validateFreshness = localArchiveAttestations.get(attestation);
   return (
-    localArchiveAttestations.has(attestation) &&
+    Boolean(validateFreshness) &&
     attestation.kind === 'archive_record_attestation' &&
-    attestation.attestationHash === archiveAttestationHash(attestation)
+    attestation.attestationHash === archiveAttestationHash(attestation) &&
+    validateFreshness!()
   );
 }
 
@@ -1113,7 +1248,13 @@ export class ArchiveStore {
     );
     if (this.databasePath !== ':memory:')
       this.database.exec('PRAGMA journal_mode = WAL;');
-    this.applyMigrations();
+    try {
+      this.applyMigrations();
+    } catch (error) {
+      this.database.close();
+      this.closed = true;
+      throw error;
+    }
   }
 
   close(): void {
@@ -1158,6 +1299,7 @@ export class ArchiveStore {
       128,
     );
     const requestJson = json(input.request);
+    const requestSummaryJson = json(actionRequestSummary(input.request));
     const inputHash = hashRawEvidence(requestJson);
     const principal = requiredText(
       input.authorization.principal,
@@ -1169,17 +1311,29 @@ export class ArchiveStore {
       'authorization.decisionCode',
       256,
     );
-    const scopeHash =
-      input.authorization.scopeHash ??
-      hashCanonicalJson({
-        kind,
-        target,
-        connectorId,
-        connectorVersion,
-        policyVersion,
-        inputHash,
-      });
-    assertSha256(scopeHash, 'authorization.scopeHash');
+    const authorizationSource = requiredText(
+      input.authorization.source ?? 'runtime_policy',
+      'authorization.source',
+      128,
+    );
+    const expectedScopeHash = hashCanonicalJson({
+      kind,
+      target,
+      connectorId,
+      connectorVersion,
+      policyVersion,
+      inputHash,
+    });
+    if (
+      input.authorization.scopeHash !== undefined &&
+      input.authorization.scopeHash !== expectedScopeHash
+    ) {
+      throw new ArchiveStoreError(
+        'AUTHORIZATION_SCOPE_MISMATCH',
+        'Authorization scope hash does not bind the normalized request and connector scope.',
+      );
+    }
+    const scopeHash = expectedScopeHash;
 
     return this.transaction(() => {
       const runId = this.insertSyncRun(input);
@@ -1203,7 +1357,7 @@ export class ArchiveStore {
           policyVersion,
           connectorId,
           connectorVersion,
-          requestJson,
+          requestSummaryJson,
           occurredAt,
           occurredAt,
         );
@@ -1232,13 +1386,61 @@ export class ArchiveStore {
         inputHash,
         connectorReadOnly: true,
       });
-      this.appendActionEventInTransaction(actionId, 'authorization', {
-        allowed: true,
-        principal,
-        decisionCode,
+      const authorizationId = `authorization_${randomUUID()}`;
+      const authorizedAt = iso(this.now());
+      const authorizationHash = hashCanonicalJson({
+        version: 'action_authorization_v1',
+        authorizationId,
+        actionId,
+        syncRunId: runId,
+        requestHash: inputHash,
         scopeHash,
-        inputHash,
+        policyVersion,
+        connectorId,
+        connectorVersion,
+        principal,
+        source: authorizationSource,
+        decisionCode,
+        authorizedAt,
       });
+      this.database
+        .prepare(
+          `INSERT INTO action_authorizations
+            (authorization_id, action_id, sync_run_id, request_hash, scope_hash,
+             policy_version, connector_id, connector_version, principal, source,
+             decision_code, authorized_at, authorization_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          authorizationId,
+          actionId,
+          runId,
+          inputHash,
+          scopeHash,
+          policyVersion,
+          connectorId,
+          connectorVersion,
+          principal,
+          authorizationSource,
+          decisionCode,
+          authorizedAt,
+          authorizationHash,
+        );
+      this.appendActionEventInTransaction(
+        actionId,
+        'authorization',
+        {
+          allowed: true,
+          authorizationId,
+          authorizationHash,
+          principal,
+          source: authorizationSource,
+          decisionCode,
+          scopeHash,
+          inputHash,
+        },
+        authorizedAt,
+      );
       return { runId, actionId };
     });
   }
@@ -1289,9 +1491,21 @@ export class ArchiveStore {
     if (phase !== 'dispatch') {
       throw new ArchiveStoreError('INVALID_INPUT', 'Action phase is invalid.');
     }
-    return this.transaction(() =>
-      this.appendActionEventInTransaction(actionId, phase, payload),
-    );
+    return this.transaction(() => {
+      const row = this.database
+        .prepare(`SELECT * FROM action_ledger_actions WHERE action_id = ?`)
+        .get(requiredText(actionId, 'actionId')) as
+        | Record<string, unknown>
+        | undefined;
+      if (!row) {
+        throw new ArchiveStoreError(
+          'ACTION_NOT_FOUND',
+          'Durable action does not exist.',
+        );
+      }
+      this.requireBoundAuthorization(row);
+      return this.appendActionEventInTransaction(actionId, phase, payload);
+    });
   }
 
   settleSyncRunAction(
@@ -1302,7 +1516,8 @@ export class ArchiveStore {
     return this.transaction(() => {
       const run = this.database
         .prepare(
-          `SELECT id, status, records_committed FROM sync_runs WHERE id = ?`,
+          `SELECT id, status, records_committed, metadata_json
+           FROM sync_runs WHERE id = ?`,
         )
         .get(runId) as Record<string, unknown> | undefined;
       if (run?.status !== 'running') {
@@ -1324,9 +1539,12 @@ export class ArchiveStore {
       }
       const actionId = String(actionRow.action_id);
       let currentPhase = actionPhase(actionRow.current_phase);
+      if (input.status === 'completed') {
+        this.requireBoundAuthorization(actionRow);
+      }
       if (currentPhase === 'dispatch') {
         this.appendActionEventInTransaction(actionId, 'observation', {
-          ...(input.observation ?? {}),
+          ...input.observation,
           status: input.status,
           stopReason: input.stopReason ?? null,
         });
@@ -1379,7 +1597,7 @@ export class ArchiveStore {
         }
         const recordSetHash = hashCanonicalJson(recordSet);
         this.appendActionEventInTransaction(actionId, 'reconciliation', {
-          ...(input.reconciliation ?? {}),
+          ...input.reconciliation,
           recordsCommitted,
           recordSetHash,
         });
@@ -1412,13 +1630,34 @@ export class ArchiveStore {
         });
       }
 
+      const skippedKnown = input.observation?.skippedKnown;
+      if (
+        skippedKnown !== undefined &&
+        (typeof skippedKnown !== 'number' ||
+          !Number.isSafeInteger(skippedKnown) ||
+          skippedKnown < 0)
+      ) {
+        throw new ArchiveStoreError(
+          'INVALID_INPUT',
+          'Observed skippedKnown must be a non-negative integer.',
+        );
+      }
+      const runMetadata = parseObject(run.metadata_json);
+      if (typeof skippedKnown === 'number')
+        runMetadata.skippedKnown = skippedKnown;
       const result = this.database
         .prepare(
           `UPDATE sync_runs
-           SET completed_at = ?, status = ?, stop_reason = ?
+           SET completed_at = ?, status = ?, stop_reason = ?, metadata_json = ?
            WHERE id = ? AND status = 'running'`,
         )
-        .run(iso(this.now()), input.status, input.stopReason ?? null, runId);
+        .run(
+          iso(this.now()),
+          input.status,
+          input.stopReason ?? null,
+          json(runMetadata),
+          runId,
+        );
       if (Number(result.changes) !== 1) {
         throw new ArchiveStoreError(
           'RUN_NOT_ACTIVE',
@@ -1448,6 +1687,29 @@ export class ArchiveStore {
       .prepare(`SELECT * FROM action_ledger_actions WHERE sync_run_id = ?`)
       .get(requiredText(runId, 'runId')) as Record<string, unknown> | undefined;
     return row ? this.actionFromRow(row) : null;
+  }
+
+  getAuthorizationForAction(
+    actionId: string,
+  ): StoredActionAuthorization | null {
+    this.assertOpen();
+    const id = requiredText(actionId, 'actionId');
+    const authorization = this.database
+      .prepare(
+        `SELECT 1 AS present FROM action_authorizations WHERE action_id = ?`,
+      )
+      .get(id) as { present?: number } | undefined;
+    if (!authorization) return null;
+    const action = this.database
+      .prepare(`SELECT * FROM action_ledger_actions WHERE action_id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    if (!action) {
+      throw new ArchiveStoreError(
+        'CORRUPT_DATABASE',
+        'Stored authorization has no parent action.',
+      );
+    }
+    return this.requireBoundAuthorization(action);
   }
 
   listActionEvents(actionId: string): StoredActionLedgerEvent[] {
@@ -1515,17 +1777,7 @@ export class ArchiveStore {
       const sourceHash = this.combinedSourceHash(artifacts);
       const now = iso(this.now());
       return this.transaction(() => {
-        const disposition = this.upsertRecord(
-          input.record,
-          recordId,
-          sourceHash,
-          now,
-        );
-        if (disposition !== 'unchanged') {
-          this.replaceChildren(input.record, recordId, sourceHash, now);
-        }
-        this.upsertArtifacts(input.record.kind, recordId, artifacts);
-
+        let actionId: string | null = null;
         if (input.runId) {
           const active = this.database
             .prepare('SELECT status FROM sync_runs WHERE id = ?')
@@ -1538,10 +1790,36 @@ export class ArchiveStore {
           }
           const action = this.database
             .prepare(
-              `SELECT action_id FROM action_ledger_actions
+              `SELECT * FROM action_ledger_actions
                WHERE sync_run_id = ? LIMIT 1`,
             )
-            .get(input.runId) as { action_id?: unknown } | undefined;
+            .get(input.runId) as Record<string, unknown> | undefined;
+          if (action) {
+            actionId = requiredText(
+              typeof action.action_id === 'string' ? action.action_id : '',
+              'actionId',
+            );
+            this.requireBoundAuthorization(action);
+            if (actionPhase(action.current_phase) !== 'dispatch') {
+              throw new ArchiveStoreError(
+                'ACTION_NOT_DISPATCHED',
+                'Authorized sync records may commit only while the durable action is dispatched.',
+              );
+            }
+          }
+        }
+        const disposition = this.upsertRecord(
+          input.record,
+          recordId,
+          sourceHash,
+          now,
+        );
+        if (disposition !== 'unchanged') {
+          this.replaceChildren(input.record, recordId, sourceHash, now);
+        }
+        this.upsertArtifacts(input.record.kind, recordId, artifacts);
+
+        if (input.runId) {
           this.database
             .prepare(
               `INSERT INTO sync_record_commits
@@ -1552,7 +1830,7 @@ export class ArchiveStore {
             .run(
               `record_commit_${randomUUID()}`,
               input.runId,
-              typeof action?.action_id === 'string' ? action.action_id : null,
+              actionId,
               recordId,
               input.record.kind,
               sourceHash,
@@ -1677,7 +1955,10 @@ export class ArchiveStore {
         .get() as
         | { catalog_id?: unknown; generation?: number | bigint }
         | undefined;
-      const catalogId = String(generationRow?.catalog_id ?? '');
+      const catalogId =
+        typeof generationRow?.catalog_id === 'string'
+          ? generationRow.catalog_id
+          : '';
       const catalogGeneration = Number(generationRow?.generation ?? 0);
       if (
         !/^catalog_[a-f0-9]{32}$/.test(catalogId) ||
@@ -1892,7 +2173,8 @@ export class ArchiveStore {
            FROM archive_catalog_state WHERE singleton = 1`,
         )
         .get() as Record<string, unknown> | undefined;
-      const catalogId = String(catalog?.catalog_id ?? '');
+      const catalogId =
+        typeof catalog?.catalog_id === 'string' ? catalog.catalog_id : '';
       const catalogGeneration = Number(catalog?.generation ?? 0);
       if (
         !/^catalog_[a-f0-9]{32}$/.test(catalogId) ||
@@ -1915,7 +2197,38 @@ export class ArchiveStore {
           catalogGeneration,
         }),
       });
-      localArchiveAttestations.add(value);
+      localArchiveAttestations.set(value, () => {
+        if (this.closed) return false;
+        try {
+          return this.readTransaction(() => {
+            const table = record.kind === 'chat' ? 'chats' : 'submissions';
+            const current = this.database
+              .prepare(
+                `SELECT source_hash, data_policy, external_processing_allowed,
+                        embargo_until
+                 FROM ${table} WHERE id = ?`,
+              )
+              .get(record.id) as Record<string, unknown> | undefined;
+            const currentCatalog = this.database
+              .prepare(
+                `SELECT catalog_id, generation
+                 FROM archive_catalog_state WHERE singleton = 1`,
+              )
+              .get() as Record<string, unknown> | undefined;
+            return (
+              current?.source_hash === record.sourceHash &&
+              current?.data_policy === record.dataPolicy &&
+              Number(current?.external_processing_allowed) ===
+                (record.externalProcessingAllowed ? 1 : 0) &&
+              nullableString(current?.embargo_until) === record.embargoUntil &&
+              currentCatalog?.catalog_id === catalogId &&
+              Number(currentCatalog?.generation) === catalogGeneration
+            );
+          });
+        } catch {
+          return false;
+        }
+      });
       return value;
     });
   }
@@ -2142,6 +2455,7 @@ export class ArchiveStore {
     actionId: string,
     phase: ActionLedgerPhase,
     payload: Record<string, JsonValue>,
+    occurredAtOverride?: string,
   ): StoredActionLedgerEvent {
     const id = requiredText(actionId, 'actionId');
     const row = this.database
@@ -2167,7 +2481,10 @@ export class ArchiveStore {
         'Action ledger sequence is invalid.',
       );
     }
-    const occurredAt = iso(this.now());
+    const occurredAt = occurredAtOverride
+      ? requiredText(occurredAtOverride, 'occurredAt', 64)
+      : iso(this.now());
+    assertTimestamp(occurredAt, 'occurredAt');
     const payloadJson = json(payload);
     const eventId = `event_${randomUUID()}`;
     this.database
@@ -2245,12 +2562,115 @@ export class ArchiveStore {
       policyVersion: String(row.policy_version),
       connectorId: String(row.connector_id),
       connectorVersion: String(row.connector_version),
-      request: parseObject(row.request_json),
+      requestSummary: parseObject(row.request_json),
       context: parseObject(row.context_json),
       terminal: Number(row.terminal) === 1,
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
+  }
+
+  private authorizationFromRow(
+    row: Record<string, unknown>,
+  ): StoredActionAuthorization {
+    const value: StoredActionAuthorization = {
+      authorizationId: String(row.authorization_id),
+      actionId: String(row.action_id),
+      syncRunId: String(row.sync_run_id),
+      requestHash: String(row.request_hash),
+      scopeHash: String(row.scope_hash),
+      policyVersion: String(row.policy_version),
+      connectorId: String(row.connector_id),
+      connectorVersion: String(row.connector_version),
+      principal: String(row.principal),
+      source: String(row.source),
+      decisionCode: String(row.decision_code),
+      authorizedAt: String(row.authorized_at),
+      authorizationHash: String(row.authorization_hash),
+    };
+    for (const [digest, label] of [
+      [value.requestHash, 'authorization.requestHash'],
+      [value.scopeHash, 'authorization.scopeHash'],
+      [value.authorizationHash, 'authorization.authorizationHash'],
+    ] as const) {
+      if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
+        throw new ArchiveStoreError(
+          'CORRUPT_DATABASE',
+          `${label} is not a valid digest.`,
+        );
+      }
+    }
+    const expected = hashCanonicalJson({
+      version: 'action_authorization_v1',
+      authorizationId: value.authorizationId,
+      actionId: value.actionId,
+      syncRunId: value.syncRunId,
+      requestHash: value.requestHash,
+      scopeHash: value.scopeHash,
+      policyVersion: value.policyVersion,
+      connectorId: value.connectorId,
+      connectorVersion: value.connectorVersion,
+      principal: value.principal,
+      source: value.source,
+      decisionCode: value.decisionCode,
+      authorizedAt: value.authorizedAt,
+    });
+    if (value.authorizationHash !== expected) {
+      throw new ArchiveStoreError(
+        'CORRUPT_DATABASE',
+        'Stored action authorization hash does not match its bound fields.',
+      );
+    }
+    return value;
+  }
+
+  private requireBoundAuthorization(
+    actionRow: Record<string, unknown>,
+  ): StoredActionAuthorization {
+    const actionId =
+      typeof actionRow.action_id === 'string' ? actionRow.action_id : '';
+    const syncRunId =
+      typeof actionRow.sync_run_id === 'string' ? actionRow.sync_run_id : '';
+    if (!actionId || !syncRunId) {
+      throw new ArchiveStoreError(
+        'CORRUPT_DATABASE',
+        'Stored action identity is invalid.',
+      );
+    }
+    const row = this.database
+      .prepare(`SELECT * FROM action_authorizations WHERE action_id = ?`)
+      .get(actionId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new ArchiveStoreError(
+        'ACTION_AUTHORIZATION_REQUIRED',
+        'Action has no v4 authorization binding and may only enter a non-success terminal state.',
+      );
+    }
+    const authorization = this.authorizationFromRow(row);
+    const action = this.actionFromRow(actionRow);
+    const expectedScopeHash = hashCanonicalJson({
+      kind: action.kind,
+      target: action.target,
+      connectorId: action.connectorId,
+      connectorVersion: action.connectorVersion,
+      policyVersion: action.policyVersion,
+      inputHash: action.inputHash,
+    });
+    if (
+      authorization.actionId !== actionId ||
+      authorization.syncRunId !== syncRunId ||
+      authorization.requestHash !== action.inputHash ||
+      authorization.scopeHash !== expectedScopeHash ||
+      authorization.policyVersion !== action.policyVersion ||
+      authorization.connectorId !== action.connectorId ||
+      authorization.connectorVersion !== action.connectorVersion
+    ) {
+      throw new ArchiveStoreError(
+        'CORRUPT_DATABASE',
+        'Stored action authorization does not match its action scope.',
+      );
+    }
+    return authorization;
   }
 
   private actionEventFromRow(
@@ -2282,25 +2702,28 @@ export class ArchiveStore {
   }
 
   private applyMigrations(): void {
-    const row = this.database.prepare('PRAGMA user_version').get() as
-      | { user_version?: number }
-      | undefined;
-    const current = Number(row?.user_version ?? 0);
-    if (current > LATEST_SCHEMA_VERSION) {
-      throw new ArchiveStoreError(
-        'SCHEMA_TOO_NEW',
-        `Database schema version ${current} is newer than supported version ${LATEST_SCHEMA_VERSION}.`,
-      );
-    }
-
-    for (const migration of MIGRATIONS) {
-      if (migration.version <= current) {
-        if (current >= 1) this.verifyAppliedMigration(migration);
-        continue;
-      }
+    let applying: Migration | null = null;
+    try {
       this.database.exec('BEGIN IMMEDIATE');
-      try {
+      const row = this.database.prepare('PRAGMA user_version').get() as
+        | { user_version?: number }
+        | undefined;
+      const current = Number(row?.user_version ?? 0);
+      if (current > LATEST_SCHEMA_VERSION) {
+        throw new ArchiveStoreError(
+          'SCHEMA_TOO_NEW',
+          `Database schema version ${current} is newer than supported version ${LATEST_SCHEMA_VERSION}.`,
+        );
+      }
+
+      for (const migration of MIGRATIONS) {
+        if (migration.version <= current) {
+          if (current >= 1) this.verifyAppliedMigration(migration);
+          continue;
+        }
+        applying = migration;
         this.database.exec(migration.sql);
+        if (migration.version === 5) this.verifyAuthorizationMigrationData();
         this.database
           .prepare(
             'INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)',
@@ -2312,19 +2735,46 @@ export class ArchiveStore {
             iso(this.now()),
           );
         this.database.exec(`PRAGMA user_version = ${migration.version}`);
-        this.database.exec('COMMIT');
-      } catch (error) {
-        try {
-          this.database.exec('ROLLBACK');
-        } catch {
-          // Preserve the migration error; SQLite may already have rolled back.
-        }
-        throw new ArchiveStoreError(
-          'MIGRATION_FAILED',
-          `Failed to apply archive migration ${migration.version} (${migration.name}).`,
-          { cause: error },
-        );
       }
+      this.database.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // Preserve the migration error; SQLite may already have rolled back.
+      }
+      if (error instanceof ArchiveStoreError) throw error;
+      const label = applying
+        ? `${applying.version} (${applying.name})`
+        : 'lock acquisition';
+      throw new ArchiveStoreError(
+        'MIGRATION_FAILED',
+        `Failed to apply archive migration ${label}.`,
+        { cause: error },
+      );
+    }
+  }
+
+  private verifyAuthorizationMigrationData(): void {
+    const mismatch = this.database
+      .prepare(
+        `SELECT 1 AS present
+         FROM sync_record_commits AS commit_link
+         LEFT JOIN action_ledger_actions AS action
+           ON action.action_id = commit_link.action_id
+         WHERE commit_link.action_id IS NOT NULL
+           AND (
+             action.action_id IS NULL
+             OR action.sync_run_id <> commit_link.sync_run_id
+           )
+         LIMIT 1`,
+      )
+      .get() as { present?: number } | undefined;
+    if (mismatch) {
+      throw new ArchiveStoreError(
+        'CORRUPT_SCHEMA',
+        'Existing record commit links contain an action/run mismatch.',
+      );
     }
   }
 

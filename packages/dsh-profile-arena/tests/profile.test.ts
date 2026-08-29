@@ -107,8 +107,11 @@ describe('Arena DSH semantic boundary', () => {
     const receipt = toProjectionReceipt({
       projectionReceipt: {
         kind: 'authorized_model_projection_receipt',
+        projectionId: `projection_${'f'.repeat(32)}`,
+        sourceRecordId: 'chat_1',
         sourceHash: `sha256:${'a'.repeat(64)}`,
         policyVersion: 'arena-model-projection-v1',
+        contentHash: `sha256:${'e'.repeat(64)}`,
         projectionHash: `sha256:${'b'.repeat(64)}`,
         record: {
           id: 'chat_1',

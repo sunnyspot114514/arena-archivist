@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 
 import {
   ArchiveStore,
+  ArchiveStoreError,
   type StoredActionLedgerAction,
   type StoredSyncRun,
 } from '../../../packages/archive-store/index';
@@ -129,6 +130,33 @@ function immediateStop(
     default:
       return null;
   }
+}
+
+export function classifyWorkerSettlement(result: WorkerRunResult): {
+  status: 'completed' | 'stopped' | 'failed';
+  terminalPhase: 'blocked' | 'failed' | 'cancelled';
+} {
+  if (result.status === 'completed') {
+    return { status: 'completed', terminalPhase: 'blocked' };
+  }
+  if (result.stopReason === 'archive_failed') {
+    return { status: 'failed', terminalPhase: 'failed' };
+  }
+  return {
+    status: 'stopped',
+    terminalPhase:
+      result.stopReason === 'user_paused' ||
+      result.stopReason === 'runtime_shutdown'
+        ? 'cancelled'
+        : 'blocked',
+  };
+}
+
+function runtimeFailureCode(error: unknown): string {
+  if (error instanceof ArchiveStoreError || error instanceof RuntimeError) {
+    return error.code;
+  }
+  return error instanceof Error ? error.name : 'runtime_error';
 }
 
 function outcome(value: string | null): AttemptOutcome {
@@ -561,6 +589,7 @@ export class ArenaRuntimeController implements RuntimeController {
         },
         authorization: {
           principal: 'loopback_runtime_client',
+          source: 'loopback_http_policy',
           decisionCode: 'bounded_readonly_policy_allow',
         },
       });
@@ -677,6 +706,7 @@ export class ArenaRuntimeController implements RuntimeController {
       throw new RuntimeError('NOT_FOUND', 'Action ledger entry not found');
     return {
       action,
+      authorization: this.#store.getAuthorizationForAction(actionId),
       events: this.#store.listActionEvents(actionId),
       recordCommits: this.#store.listSyncRecordCommits(action.syncRunId),
     };
@@ -803,6 +833,7 @@ export class ArenaRuntimeController implements RuntimeController {
       });
       this.#settleRun(run, result);
     } catch (error) {
+      const errorCode = runtimeFailureCode(error);
       const current = this.#store.getSyncRun(run.id);
       if (current?.status === 'running') {
         try {
@@ -811,7 +842,7 @@ export class ArenaRuntimeController implements RuntimeController {
             status: 'failed',
             stopReason: 'runtime_error',
             observation: {
-              error: error instanceof Error ? error.name : 'runtime_error',
+              error: errorCode,
             },
           });
         } catch {
@@ -826,7 +857,7 @@ export class ArenaRuntimeController implements RuntimeController {
         layer: 'runtime',
         mode: run.source === 'live' ? 'COLLECT_MODE' : 'DEMO_MODE',
         allowed: false,
-        reason: error instanceof Error ? error.name : 'runtime_error',
+        reason: errorCode,
         action: 'run_failed',
       });
     } finally {
@@ -835,12 +866,12 @@ export class ArenaRuntimeController implements RuntimeController {
   }
 
   #settleRun(run: ActiveRun, result: WorkerRunResult): void {
+    const settlement = classifyWorkerSettlement(result);
     this.#store.settleSyncRunAction({
       runId: run.id,
-      status: result.status === 'completed' ? 'completed' : 'stopped',
+      status: settlement.status,
       stopReason: result.stopReason ?? undefined,
-      terminalPhase:
-        result.stopReason === 'user_paused' ? 'cancelled' : 'blocked',
+      terminalPhase: settlement.terminalPhase,
       observation: {
         workerStatus: result.status,
         stopReason: result.stopReason,

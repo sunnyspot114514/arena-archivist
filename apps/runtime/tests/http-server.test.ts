@@ -45,6 +45,11 @@ async function fixtureServer() {
           code: 'INVALID_CURSOR',
         });
       }
+      if (input.cursor === 'mismatch') {
+        throw Object.assign(new Error('query changed'), {
+          code: 'QUERY_CURSOR_MISMATCH',
+        });
+      }
       return {
         items: [{ id: 'chat_1' }],
         nextCursor: 'next',
@@ -122,6 +127,11 @@ describe('runtime archive HTTP boundary', () => {
     expect(invalid.status).toBe(400);
     expect(await invalid.json()).toEqual(
       expect.objectContaining({ code: 'INVALID_CURSOR' }),
+    );
+    const mismatch = await fetch(`${baseUrl}/v1/records/query?cursor=mismatch`);
+    expect(mismatch.status).toBe(400);
+    expect(await mismatch.json()).toEqual(
+      expect.objectContaining({ code: 'QUERY_CURSOR_MISMATCH' }),
     );
     const stale = await fetch(`${baseUrl}/v1/records/query?cursor=stale`);
     expect(stale.status).toBe(409);

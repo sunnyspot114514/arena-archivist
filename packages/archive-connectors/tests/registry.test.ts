@@ -44,6 +44,19 @@ describe('archive connector registry', () => {
     );
   });
 
+  it('rejects mutable connector implementations before returning an execution handle', () => {
+    const mutable = {
+      metadata: {
+        ...graySwanArchiveConnector.metadata,
+        recordKinds: [...graySwanArchiveConnector.metadata.recordKinds],
+        capabilities: [...graySwanArchiveConnector.metadata.capabilities],
+      },
+    } as ArchiveConnector;
+    expect(() => new ArchiveConnectorRegistry().register(mutable)).toThrow(
+      /must be frozen/,
+    );
+  });
+
   it('delegates Gray Swan fixture parsing to the existing adapter facade', async () => {
     const contract = await graySwanArchiveConnector.loadContract(
       resolve('packages/gray-swan-adapter/contracts/grayswan.fixture-v1.json'),

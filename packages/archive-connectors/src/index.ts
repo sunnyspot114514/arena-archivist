@@ -95,6 +95,16 @@ export class ArchiveConnectorRegistry {
 
   register<T extends ArchiveConnector>(connector: T): T {
     validateMetadata(connector.metadata);
+    if (
+      !Object.isFrozen(connector) ||
+      !Object.isFrozen(connector.metadata) ||
+      !Object.isFrozen(connector.metadata.recordKinds) ||
+      !Object.isFrozen(connector.metadata.capabilities)
+    ) {
+      throw new Error(
+        'Archive connectors and their metadata must be frozen before registration',
+      );
+    }
     const id = connector.metadata.id;
     if (this.#connectors.has(id)) {
       throw new Error(`Archive connector already registered: ${id}`);

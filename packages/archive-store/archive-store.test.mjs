@@ -91,7 +91,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
     const first = store.commitRecord(input);
     const retry = store.commitRecord(input);
 
-    assert.equal(archiveSchema.latestVersion, 3);
+    assert.equal(archiveSchema.latestVersion, 5);
     assert.equal(first.disposition, 'inserted');
     assert.equal(retry.disposition, 'unchanged');
     assert.equal(first.recordId, retry.recordId);
@@ -174,7 +174,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
     const database = new DatabaseSync(paths.databasePath);
     assert.equal(
       Number(database.prepare('PRAGMA user_version').get().user_version),
-      3,
+      5,
     );
     assert.equal(
       Number(
@@ -206,7 +206,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
       databasePath: paths.databasePath,
       evidenceDirectory: paths.evidenceDirectory,
     });
-    assert.equal(reopened.schemaVersion, 3);
+    assert.equal(reopened.schemaVersion, 5);
     reopened.close();
   } finally {
     rmSync(paths.directory, { recursive: true, force: true });
@@ -324,9 +324,15 @@ test('persists the complete authorized action lifecycle with its sync run', () =
       connectorId: 'gray-swan',
       connectorVersion: '1.0.0',
       policyVersion: 'arena-read-only-sync-v1',
-      request: { source: 'demo', maxRecords: 10 },
+      request: {
+        source: 'demo',
+        maxRecords: 10,
+        operation: 'sync_next_batch',
+        rawBody: 'must-not-be-persisted',
+      },
       authorization: {
         principal: 'local_operator',
+        source: 'loopback_http_policy',
         decisionCode: 'manual_loopback_request',
       },
     });
@@ -338,6 +344,33 @@ test('persists the complete authorized action lifecycle with its sync run', () =
       store.listActionEvents(created.actionId).map((event) => event.phase),
       ['proposal', 'validation', 'authorization'],
     );
+    assert.deepEqual(store.getAction(created.actionId)?.requestSummary, {
+      maxRecords: 10,
+      operation: 'sync_next_batch',
+      source: 'demo',
+    });
+    const authorization = store.getAuthorizationForAction(created.actionId);
+    assert.equal(authorization?.actionId, created.actionId);
+    assert.equal(authorization?.syncRunId, created.runId);
+    assert.equal(
+      authorization?.requestHash,
+      store.getAction(created.actionId)?.inputHash,
+    );
+    assert.equal(authorization?.principal, 'local_operator');
+    assert.equal(authorization?.source, 'loopback_http_policy');
+    assert.match(authorization?.scopeHash ?? '', /^sha256:[a-f0-9]{64}$/);
+    assert.match(
+      authorization?.authorizationHash ?? '',
+      /^sha256:[a-f0-9]{64}$/,
+    );
+
+    assert.throws(
+      () => store.commitRecord(chatInput({ runId: created.runId })),
+      (error) => error?.code === 'ACTION_NOT_DISPATCHED',
+    );
+    assert.equal(store.countRecords('chat'), 0);
+    assert.equal(store.getCheckpoint('chats'), null);
+    assert.deepEqual(store.listSyncRecordCommits(created.runId), []);
 
     store.advanceAction(created.actionId, 'dispatch', {
       requestedMaxRecords: 10,
@@ -402,7 +435,415 @@ test('persists the complete authorized action lifecycle with its sync run', () =
         .prepare('DELETE FROM action_ledger_events WHERE event_id = ?')
         .run(events[0].eventId),
     );
+    assert.throws(() =>
+      database
+        .prepare(
+          "UPDATE action_authorizations SET principal = 'changed' WHERE action_id = ?",
+        )
+        .run(created.actionId),
+    );
+    assert.throws(() =>
+      database
+        .prepare('DELETE FROM action_authorizations WHERE action_id = ?')
+        .run(created.actionId),
+    );
+    assert.throws(() =>
+      database
+        .prepare('DELETE FROM sync_record_commits WHERE sync_run_id = ?')
+        .run(created.runId),
+    );
     database.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('rejects an authorization scope hash that is not bound to the request', () => {
+  const paths = workspace();
+  try {
+    const store = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    assert.throws(
+      () =>
+        store.startAuthorizedSyncRun({
+          id: 'run_bad_scope',
+          actionId: 'action_bad_scope',
+          connectorId: 'gray-swan',
+          connectorVersion: '1.0.0',
+          policyVersion: 'arena-read-only-sync-v1',
+          request: { source: 'demo', maxRecords: 1 },
+          authorization: {
+            principal: 'loopback_runtime_client',
+            decisionCode: 'bounded_readonly_policy_allow',
+            scopeHash: `sha256:${'0'.repeat(64)}`,
+          },
+        }),
+      (error) => error?.code === 'AUTHORIZATION_SCOPE_MISMATCH',
+    );
+    assert.equal(store.getSyncRun('run_bad_scope'), null);
+    assert.equal(store.getAction('action_bad_scope'), null);
+    store.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('upgrades a v3 database, scrubs legacy request bodies, and creates new authorization rows', () => {
+  const paths = workspace();
+  try {
+    const initial = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    initial.startAuthorizedSyncRun({
+      id: 'run_legacy_v3',
+      actionId: 'action_legacy_v3',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    const legacyDispatched = initial.startAuthorizedSyncRun({
+      id: 'run_legacy_dispatch_v3',
+      actionId: 'action_legacy_dispatch_v3',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'live', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    initial.advanceAction(legacyDispatched.actionId, 'dispatch');
+    initial.close();
+
+    const legacy = new DatabaseSync(paths.databasePath);
+    for (const trigger of [
+      'action_authorizations_append_only_update',
+      'action_authorizations_append_only_delete',
+      'action_authorizations_action_binding',
+      'sync_record_commits_action_run_match',
+      'sync_record_commits_authorization_required',
+      'sync_record_commits_append_only_update',
+      'sync_record_commits_append_only_delete',
+    ]) {
+      legacy.exec(`DROP TRIGGER ${trigger}`);
+    }
+    legacy.exec('DROP INDEX action_authorizations_run_idx');
+    legacy.exec('DROP TABLE action_authorizations');
+    legacy.prepare('DELETE FROM schema_migrations WHERE version >= 4').run();
+    legacy
+      .prepare('UPDATE action_ledger_actions SET request_json = ?')
+      .run('{"rawBody":"legacy-sensitive-body"}');
+    legacy.exec('PRAGMA user_version = 3');
+    legacy.close();
+
+    const upgraded = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    assert.equal(upgraded.schemaVersion, 5);
+    assert.deepEqual(
+      upgraded.getAction('action_legacy_v3')?.requestSummary,
+      {},
+    );
+    assert.equal(upgraded.getAuthorizationForAction('action_legacy_v3'), null);
+    assert.equal(
+      upgraded.getAuthorizationForAction('action_legacy_dispatch_v3'),
+      null,
+    );
+    assert.throws(
+      () => upgraded.advanceAction('action_legacy_v3', 'dispatch'),
+      (error) => error?.code === 'ACTION_AUTHORIZATION_REQUIRED',
+    );
+    const forgedDatabase = new DatabaseSync(paths.databasePath);
+    const legacyAction = forgedDatabase
+      .prepare(
+        `SELECT action_id, sync_run_id, input_hash, policy_version,
+                connector_id, connector_version
+         FROM action_ledger_actions WHERE action_id = ?`,
+      )
+      .get('action_legacy_v3');
+    const forgedAuthorization = {
+      authorizationId: 'authorization_forged_scope',
+      actionId: legacyAction.action_id,
+      syncRunId: legacyAction.sync_run_id,
+      requestHash: legacyAction.input_hash,
+      scopeHash: `sha256:${'0'.repeat(64)}`,
+      policyVersion: legacyAction.policy_version,
+      connectorId: legacyAction.connector_id,
+      connectorVersion: legacyAction.connector_version,
+      principal: 'forged_principal',
+      source: 'forged_source',
+      decisionCode: 'forged_decision',
+      authorizedAt: '2026-08-29T00:00:00.000Z',
+    };
+    const forgedAuthorizationHash = hashCanonicalJson({
+      version: 'action_authorization_v1',
+      ...forgedAuthorization,
+    });
+    forgedDatabase
+      .prepare(
+        `INSERT INTO action_authorizations
+          (authorization_id, action_id, sync_run_id, request_hash, scope_hash,
+           policy_version, connector_id, connector_version, principal, source,
+           decision_code, authorized_at, authorization_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        forgedAuthorization.authorizationId,
+        forgedAuthorization.actionId,
+        forgedAuthorization.syncRunId,
+        forgedAuthorization.requestHash,
+        forgedAuthorization.scopeHash,
+        forgedAuthorization.policyVersion,
+        forgedAuthorization.connectorId,
+        forgedAuthorization.connectorVersion,
+        forgedAuthorization.principal,
+        forgedAuthorization.source,
+        forgedAuthorization.decisionCode,
+        forgedAuthorization.authorizedAt,
+        forgedAuthorizationHash,
+      );
+    forgedDatabase.close();
+    assert.throws(
+      () => upgraded.getAuthorizationForAction('action_legacy_v3'),
+      (error) => error?.code === 'CORRUPT_DATABASE',
+    );
+    assert.throws(
+      () => upgraded.advanceAction('action_legacy_v3', 'dispatch'),
+      (error) => error?.code === 'CORRUPT_DATABASE',
+    );
+    assert.throws(
+      () =>
+        upgraded.commitRecord({
+          runId: 'run_legacy_dispatch_v3',
+          record: {
+            kind: 'chat',
+            platform: 'gray-swan',
+            externalId: 'legacy_unbound_chat',
+            normalized: {},
+          },
+          evidence: [
+            { artifactType: 'page_html', content: '<html>legacy</html>' },
+          ],
+          checkpoint: {
+            scope: 'legacy_unbound_scope',
+            cursor: 'legacy_unbound_cursor',
+            expectedVersion: 0,
+          },
+        }),
+      (error) => error?.code === 'ACTION_AUTHORIZATION_REQUIRED',
+    );
+    assert.equal(
+      upgraded.getRecord('chat', 'gray-swan', 'legacy_unbound_chat'),
+      null,
+    );
+    assert.equal(upgraded.getCheckpoint('legacy_unbound_scope'), null);
+    assert.throws(
+      () =>
+        upgraded.settleSyncRunAction({
+          runId: 'run_legacy_dispatch_v3',
+          status: 'completed',
+          reconciliation: { workerCommitted: 0 },
+        }),
+      (error) => error?.code === 'ACTION_AUTHORIZATION_REQUIRED',
+    );
+    assert.equal(
+      upgraded.getAction('action_legacy_dispatch_v3')?.currentPhase,
+      'dispatch',
+    );
+    assert.equal(
+      upgraded.getSyncRun('run_legacy_dispatch_v3')?.status,
+      'running',
+    );
+    upgraded.settleSyncRunAction({
+      runId: 'run_legacy_v3',
+      status: 'failed',
+      stopReason: 'authorization_binding_missing',
+    });
+    upgraded.settleSyncRunAction({
+      runId: 'run_legacy_dispatch_v3',
+      status: 'failed',
+      stopReason: 'authorization_binding_missing',
+    });
+    const created = upgraded.startAuthorizedSyncRun({
+      id: 'run_after_v4',
+      actionId: 'action_after_v4',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    assert.equal(
+      upgraded.getAuthorizationForAction(created.actionId)?.syncRunId,
+      created.runId,
+    );
+    upgraded.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('upgrades an existing v4 database without rewriting its migration checksum', () => {
+  const paths = workspace();
+  try {
+    const initial = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    const created = initial.startAuthorizedSyncRun({
+      id: 'run_existing_v4',
+      actionId: 'action_existing_v4',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    initial.close();
+
+    const versionFour = new DatabaseSync(paths.databasePath);
+    versionFour.exec('DROP TRIGGER action_authorizations_action_binding');
+    versionFour.exec('DROP TRIGGER sync_record_commits_authorization_required');
+    versionFour
+      .prepare('DELETE FROM schema_migrations WHERE version = 5')
+      .run();
+    versionFour.exec('PRAGMA user_version = 4');
+    versionFour.close();
+
+    const upgraded = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    assert.equal(upgraded.schemaVersion, 5);
+    assert.equal(
+      upgraded.getAuthorizationForAction(created.actionId)?.syncRunId,
+      created.runId,
+    );
+    upgraded.advanceAction(created.actionId, 'dispatch');
+    upgraded.settleSyncRunAction({
+      runId: created.runId,
+      status: 'stopped',
+      stopReason: 'user_paused',
+      terminalPhase: 'cancelled',
+    });
+    upgraded.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('fails a legacy upgrade atomically when an action/run commit link is mismatched', () => {
+  const paths = workspace();
+  try {
+    const initial = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    const first = initial.startAuthorizedSyncRun({
+      id: 'run_migration_link_first',
+      actionId: 'action_migration_link_first',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    const second = initial.startAuthorizedSyncRun({
+      id: 'run_migration_link_second',
+      actionId: 'action_migration_link_second',
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    initial.advanceAction(first.actionId, 'dispatch');
+    initial.commitRecord({
+      runId: first.runId,
+      record: {
+        kind: 'chat',
+        platform: 'gray-swan',
+        externalId: 'migration_link_chat',
+        normalized: {},
+      },
+      evidence: [
+        { artifactType: 'page_html', content: '<html>migration</html>' },
+      ],
+      checkpoint: {
+        scope: 'migration_link_scope',
+        cursor: 'migration_link_cursor',
+        expectedVersion: 0,
+      },
+    });
+    initial.close();
+
+    const legacy = new DatabaseSync(paths.databasePath);
+    for (const trigger of [
+      'action_authorizations_action_binding',
+      'action_authorizations_append_only_update',
+      'action_authorizations_append_only_delete',
+      'sync_record_commits_action_run_match',
+      'sync_record_commits_authorization_required',
+      'sync_record_commits_append_only_update',
+      'sync_record_commits_append_only_delete',
+    ]) {
+      legacy.exec(`DROP TRIGGER ${trigger}`);
+    }
+    legacy.exec('DROP INDEX action_authorizations_run_idx');
+    legacy.exec('DROP TABLE action_authorizations');
+    legacy.prepare('DELETE FROM schema_migrations WHERE version >= 4').run();
+    legacy
+      .prepare(
+        'UPDATE sync_record_commits SET sync_run_id = ? WHERE action_id = ?',
+      )
+      .run(second.runId, first.actionId);
+    legacy.exec('PRAGMA user_version = 3');
+    legacy.close();
+
+    assert.throws(
+      () =>
+        new ArchiveStore({
+          databasePath: paths.databasePath,
+          evidenceDirectory: paths.evidenceDirectory,
+        }),
+      (error) => error?.code === 'CORRUPT_SCHEMA',
+    );
+    const unchanged = new DatabaseSync(paths.databasePath);
+    assert.equal(
+      Number(unchanged.prepare('PRAGMA user_version').get().user_version),
+      3,
+    );
+    assert.equal(
+      unchanged
+        .prepare(
+          "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'action_authorizations'",
+        )
+        .get().count,
+      0,
+    );
+    unchanged.close();
   } finally {
     rmSync(paths.directory, { recursive: true, force: true });
   }

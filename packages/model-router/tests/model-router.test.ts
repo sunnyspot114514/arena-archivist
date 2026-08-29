@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,7 @@ import {
   createAuthorizedModelProjection,
   ModelRouter,
   type AuthorizedModelProjection,
+  type CompletionRequest,
   type ProviderRoute,
 } from '../src/index';
 
@@ -44,11 +45,18 @@ const routerRoute: ProviderRoute = {
   promptLogging: false,
 };
 
+const fixtureCleanups: Array<() => void> = [];
+
+afterEach(() => {
+  for (const cleanup of fixtureCleanups.splice(0).reverse()) cleanup();
+});
+
 function attestation(
   level: DataPolicy,
   overrides: {
     externalProcessingAllowed?: boolean;
     embargoUntil?: string | null;
+    title?: string;
   } = {},
 ): AttestedArchiveRecord {
   const directory = mkdtempSync(join(tmpdir(), 'arena-model-router-'));
@@ -63,7 +71,7 @@ function attestation(
         kind: 'chat',
         platform: 'gray-swan-fixture',
         externalId: 'external_fixture',
-        title: 'Fixture',
+        title: overrides.title ?? 'Fixture',
         status: 'complete',
         normalized: {},
         dataPolicy: level,
@@ -77,16 +85,25 @@ function attestation(
       checkpoint: { scope: 'fixture', cursor: 'fixture', expectedVersion: 0 },
     });
     const value = store.attestRecord(committed.recordId);
-    store.close();
     if (!value) throw new Error('fixture attestation missing');
+    fixtureCleanups.push(() => {
+      store.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 20,
+      });
+    });
     return value;
-  } finally {
+  } catch (error) {
     rmSync(directory, {
       recursive: true,
       force: true,
       maxRetries: 5,
       retryDelay: 20,
     });
+    throw error;
   }
 }
 
@@ -208,10 +225,12 @@ describe('data classification routing', () => {
       routes: [directRoute],
       auth,
       fetchImpl: async (_url, init) => {
-        providerBody = JSON.parse(String(init?.body)) as Record<
-          string,
-          unknown
-        >;
+        const requestBody = init?.body;
+        expect(typeof requestBody).toBe('string');
+        if (typeof requestBody !== 'string') {
+          throw new Error('provider request body must be a string');
+        }
+        providerBody = JSON.parse(requestBody) as Record<string, unknown>;
         return new Response(
           JSON.stringify({
             id: 'request_1',
@@ -221,12 +240,13 @@ describe('data classification routing', () => {
         );
       },
     });
+    const projection = createAuthorizedModelProjection(
+      attestation('direct_provider_only'),
+    );
     await router.complete({
       task: 'offline_review',
       routeId: 'direct',
-      projection: createAuthorizedModelProjection(
-        attestation('direct_provider_only'),
-      ),
+      projection,
     });
     const captured = providerBody as Record<string, unknown> | null;
     if (!captured) throw new Error('provider body was not captured');
@@ -238,7 +258,107 @@ describe('data classification routing', () => {
     expect(messages[0].content).toContain(
       'authorized redacted archive projection',
     );
-    expect(messages[1].content).toContain('authorized_model_projection');
+    expect(messages[1].content).toContain('sensitivity');
+    expect(messages[1].content).not.toContain('authorized_model_projection');
+    expect(messages[1].content).not.toContain(projection.sourceHash);
+    expect(messages[1].content).not.toContain(projection.projectionHash);
+    expect(messages[1].content).not.toContain(
+      projection.authorization.authorizationHash,
+    );
     expect(messages[1].content).not.toContain('external_fixture');
+  });
+
+  it('snapshots the authorized projection and route across credential awaits', async () => {
+    let resolveCredentialWait: (() => void) | undefined;
+    const credentialWait = new Promise<void>((resolve) => {
+      resolveCredentialWait = resolve;
+    });
+    let credentialRequested: (() => void) | undefined;
+    const credentialRequestedPromise = new Promise<void>((resolve) => {
+      credentialRequested = resolve;
+    });
+    let requestedUrl = '';
+    let providerBody: Record<string, unknown> | null = null;
+    const auth: AuthBroker & CredentialExecutor = {
+      status: async () => ({
+        provider: 'fixture-direct',
+        connectionId: 'direct',
+        status: 'connected',
+      }),
+      begin: async () => ({ status: 'connected' }),
+      disconnect: async () => undefined,
+      resolveCredential: async () => {
+        credentialRequested?.();
+        await credentialWait;
+        return new OpaqueCredentialHandle('direct', 'fixture-direct');
+      },
+      withCredential: async <T>(
+        _handle: OpaqueCredentialHandle,
+        operation: (secret: string) => Promise<T>,
+      ) => operation('fixture-secret'),
+    };
+    const mutableRoute: ProviderRoute = {
+      ...directRoute,
+      additionalBody: { routeMarker: 'authorized-route' },
+    };
+    const router = new ModelRouter({
+      routes: [mutableRoute],
+      auth,
+      fetchImpl: async (url, init) => {
+        requestedUrl =
+          typeof url === 'string'
+            ? url
+            : url instanceof URL
+              ? url.href
+              : url.url;
+        const requestBody = init?.body;
+        if (typeof requestBody !== 'string') {
+          throw new Error('provider request body must be a string');
+        }
+        providerBody = JSON.parse(requestBody) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            id: 'request_snapshot',
+            choices: [{ message: { content: 'ok' } }],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      },
+    });
+    const allowed = createAuthorizedModelProjection(
+      attestation('direct_provider_only', { title: 'AUTHORIZED_CONTENT' }),
+    );
+    const denied = createAuthorizedModelProjection(
+      attestation('local_only', { title: 'LOCAL_ONLY_MUST_NOT_LEAK' }),
+    );
+    const mutableRequest: CompletionRequest = {
+      task: 'offline_review',
+      routeId: 'direct',
+      projection: allowed,
+      temperature: 0.25,
+    };
+
+    const completion = router.complete(mutableRequest);
+    await credentialRequestedPromise;
+    mutableRequest.projection = denied;
+    mutableRequest.temperature = 0.9;
+    mutableRoute.baseUrl = 'https://credential-thief.invalid/v1';
+    mutableRoute.model = 'mutated-model';
+    mutableRoute.additionalBody = {
+      messages: [{ role: 'user', content: 'route injection' }],
+      routeMarker: 'mutated-route',
+    };
+    resolveCredentialWait?.();
+    await completion;
+
+    expect(requestedUrl).toBe('https://direct.invalid/v1/chat/completions');
+    const captured = providerBody as Record<string, unknown> | null;
+    if (!captured) throw new Error('provider body was not captured');
+    expect(captured.model).toBe('fixture-model');
+    expect(captured.temperature).toBe(0.25);
+    expect(captured.routeMarker).toBe('authorized-route');
+    expect(JSON.stringify(captured)).toContain('AUTHORIZED_CONTENT');
+    expect(JSON.stringify(captured)).not.toContain('LOCAL_ONLY_MUST_NOT_LEAK');
+    expect(JSON.stringify(captured)).not.toContain('route injection');
   });
 });
