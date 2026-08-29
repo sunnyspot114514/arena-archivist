@@ -18,6 +18,9 @@ export type ArenaRuntimeStatus = {
   };
   run: {
     id: string;
+    actionId: string | null;
+    actionPhase: string | null;
+    connectorId: string | null;
     state: 'running' | 'completed' | 'stopped' | 'failed';
     source: 'demo' | 'live';
     requested: number;
@@ -39,6 +42,15 @@ export type ArenaRuntimeStatus = {
     status: 'connected' | 'disconnected';
     activeModel?: string | null;
   }>;
+  connectors: Array<{
+    id: string;
+    displayName: string;
+    version: string;
+    readOnly: true;
+    recordKinds: readonly string[];
+    capabilities: readonly string[];
+    cursorFormat: string;
+  }>;
 };
 
 export type NvidiaProviderStatus = {
@@ -58,7 +70,15 @@ export type ArchiveListItem = {
   title: string | null;
   outcome: string | null;
   dataPolicy: string;
+  sourceHash?: string;
   updatedAt: string;
+};
+
+export type ArchiveQueryPage = {
+  items: ArchiveListItem[];
+  nextCursor: string | null;
+  queryHash: string;
+  catalogGeneration: number;
 };
 
 export type PolicyEvent = {
@@ -152,6 +172,24 @@ export const arenaRuntime = {
     runtimeRequest<{ items: ArchiveListItem[]; total: number }>(
       `/v1/records?limit=${limit}&offset=0`,
     ),
+  queryRecords: (
+    input: {
+      limit?: number;
+      kind?: 'chat' | 'submission';
+      platform?: string;
+      cursor?: string;
+    } = {},
+  ) => {
+    const query = new URLSearchParams({
+      limit: String(input.limit ?? 8),
+    });
+    if (input.kind) query.set('kind', input.kind);
+    if (input.platform) query.set('platform', input.platform);
+    if (input.cursor) query.set('cursor', input.cursor);
+    return runtimeRequest<ArchiveQueryPage>(
+      `/v1/records/query?${query.toString()}`,
+    );
+  },
   listPolicyEvents: (limit = 8) =>
     runtimeRequest<{ items: PolicyEvent[]; total: number }>(
       `/v1/policy/events?limit=${limit}&offset=0`,

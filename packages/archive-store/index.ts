@@ -140,6 +140,20 @@ export interface RecordListOptions {
   offset?: number;
 }
 
+export interface RecordQueryOptions {
+  kind?: ArchiveRecord['kind'];
+  platform?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface RecordQueryPage {
+  items: StoredRecordSummary[];
+  nextCursor: string | null;
+  queryHash: string;
+  catalogGeneration: number;
+}
+
 export interface StoredRecordSummary {
   id: string;
   kind: ArchiveRecord['kind'];
@@ -185,6 +199,14 @@ export interface StoredArchiveRecord extends StoredRecordSummary {
   messages: StoredArchivedMessage[];
   judgeResults: StoredArchivedJudgeResult[];
   artifacts: StoredArtifact[];
+}
+
+export interface AttestedArchiveRecord {
+  readonly kind: 'archive_record_attestation';
+  readonly record: StoredArchiveRecord;
+  readonly catalogId: string;
+  readonly catalogGeneration: number;
+  readonly attestationHash: string;
 }
 
 export type SyncRunStatus = 'running' | 'completed' | 'stopped' | 'failed';
@@ -264,6 +286,87 @@ export interface SyncRunInput {
   id?: string;
   requestedMaxRecords?: number;
   metadata?: Record<string, JsonValue>;
+}
+
+export type ActionLedgerPhase =
+  | 'proposal'
+  | 'validation'
+  | 'authorization'
+  | 'dispatch'
+  | 'observation'
+  | 'reconciliation'
+  | 'canonical_commit'
+  | 'blocked'
+  | 'failed'
+  | 'cancelled';
+
+export interface AuthorizedSyncRunInput extends SyncRunInput {
+  actionId?: string;
+  kind?: string;
+  target?: string;
+  connectorId: string;
+  connectorVersion: string;
+  policyVersion: string;
+  request: Record<string, JsonValue>;
+  authorization: {
+    principal: string;
+    decisionCode: string;
+    scopeHash?: string;
+  };
+}
+
+export interface StoredActionLedgerAction {
+  actionId: string;
+  syncRunId: string;
+  kind: string;
+  target: string;
+  currentPhase: ActionLedgerPhase;
+  sequence: number;
+  inputHash: string;
+  policyVersion: string;
+  connectorId: string;
+  connectorVersion: string;
+  request: Record<string, JsonValue>;
+  context: Record<string, JsonValue>;
+  terminal: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StoredActionLedgerEvent {
+  eventId: string;
+  actionId: string;
+  syncRunId: string;
+  sequence: number;
+  fromPhase: ActionLedgerPhase | null;
+  phase: ActionLedgerPhase;
+  occurredAt: string;
+  inputHash: string;
+  policyVersion: string;
+  connectorId: string;
+  connectorVersion: string;
+  payloadHash: string;
+  payload: Record<string, JsonValue>;
+}
+
+export interface StoredSyncRecordCommit {
+  id: string;
+  syncRunId: string;
+  actionId: string | null;
+  recordId: string;
+  recordType: ArchiveRecord['kind'];
+  sourceHash: string;
+  disposition: CommitRecordResult['disposition'];
+  committedAt: string;
+}
+
+export interface SettleSyncRunActionInput {
+  runId: string;
+  status: 'completed' | 'stopped' | 'failed';
+  stopReason?: string;
+  observation?: Record<string, JsonValue>;
+  reconciliation?: Record<string, JsonValue>;
+  terminalPhase?: 'blocked' | 'failed' | 'cancelled';
 }
 
 export interface PolicyDecisionInput {
@@ -494,6 +597,141 @@ const MIGRATIONS: readonly Migration[] = [
       END;
     `,
   },
+  {
+    version: 3,
+    name: 'durable_action_ledger_and_catalog_generation',
+    sql: `
+      CREATE TABLE archive_catalog_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        catalog_id TEXT NOT NULL UNIQUE,
+        generation INTEGER NOT NULL CHECK (generation > 0)
+      ) STRICT;
+
+      INSERT INTO archive_catalog_state (singleton, catalog_id, generation)
+      VALUES (1, 'catalog_' || lower(hex(randomblob(16))), 1);
+
+      CREATE INDEX chats_keyset_idx ON chats(updated_at DESC, id ASC);
+      CREATE INDEX submissions_keyset_idx ON submissions(updated_at DESC, id ASC);
+      CREATE INDEX chats_platform_keyset_idx ON chats(platform, updated_at DESC, id ASC);
+      CREATE INDEX submissions_platform_keyset_idx ON submissions(platform, updated_at DESC, id ASC);
+
+      CREATE TRIGGER chats_catalog_insert
+      AFTER INSERT ON chats
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TRIGGER chats_catalog_update
+      AFTER UPDATE ON chats
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TRIGGER chats_catalog_delete
+      AFTER DELETE ON chats
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TRIGGER submissions_catalog_insert
+      AFTER INSERT ON submissions
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TRIGGER submissions_catalog_update
+      AFTER UPDATE ON submissions
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TRIGGER submissions_catalog_delete
+      AFTER DELETE ON submissions
+      BEGIN
+        UPDATE archive_catalog_state SET generation = generation + 1 WHERE singleton = 1;
+      END;
+
+      CREATE TABLE action_ledger_actions (
+        action_id TEXT PRIMARY KEY,
+        sync_run_id TEXT NOT NULL UNIQUE REFERENCES sync_runs(id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL,
+        target TEXT NOT NULL,
+        current_phase TEXT NOT NULL CHECK (current_phase IN (
+          'proposal', 'validation', 'authorization', 'dispatch', 'observation',
+          'reconciliation', 'canonical_commit', 'blocked', 'failed', 'cancelled'
+        )),
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        input_hash TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        connector_version TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        context_json TEXT NOT NULL DEFAULT '{}',
+        terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (action_id, sync_run_id)
+      ) STRICT;
+
+      CREATE TABLE action_ledger_events (
+        event_id TEXT PRIMARY KEY,
+        action_id TEXT NOT NULL,
+        sync_run_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        from_phase TEXT CHECK (from_phase IS NULL OR from_phase IN (
+          'proposal', 'validation', 'authorization', 'dispatch', 'observation',
+          'reconciliation', 'canonical_commit', 'blocked', 'failed', 'cancelled'
+        )),
+        phase TEXT NOT NULL CHECK (phase IN (
+          'proposal', 'validation', 'authorization', 'dispatch', 'observation',
+          'reconciliation', 'canonical_commit', 'blocked', 'failed', 'cancelled'
+        )),
+        occurred_at TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        connector_version TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        UNIQUE (action_id, sequence),
+        FOREIGN KEY (action_id, sync_run_id)
+          REFERENCES action_ledger_actions(action_id, sync_run_id) ON DELETE RESTRICT
+      ) STRICT;
+
+      CREATE INDEX action_ledger_events_run_idx
+        ON action_ledger_events(sync_run_id, sequence);
+      CREATE INDEX action_ledger_events_action_idx
+        ON action_ledger_events(action_id, sequence);
+
+      CREATE TABLE sync_record_commits (
+        id TEXT PRIMARY KEY,
+        sync_run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE RESTRICT,
+        action_id TEXT REFERENCES action_ledger_actions(action_id) ON DELETE RESTRICT,
+        record_id TEXT NOT NULL,
+        record_type TEXT NOT NULL CHECK (record_type IN ('chat', 'submission')),
+        source_hash TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (disposition IN ('inserted', 'updated', 'unchanged')),
+        committed_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX sync_record_commits_run_idx
+        ON sync_record_commits(sync_run_id, record_id);
+      CREATE INDEX sync_record_commits_action_idx
+        ON sync_record_commits(action_id, record_id);
+
+      CREATE TRIGGER action_ledger_events_append_only_update
+      BEFORE UPDATE ON action_ledger_events
+      BEGIN
+        SELECT RAISE(ABORT, 'action ledger events are append-only');
+      END;
+
+      CREATE TRIGGER action_ledger_events_append_only_delete
+      BEFORE DELETE ON action_ledger_events
+      BEGIN
+        SELECT RAISE(ABORT, 'action ledger events are append-only');
+      END;
+    `,
+  },
 ];
 
 const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]?.version ?? 0;
@@ -654,6 +892,152 @@ function json(value: JsonValue | Record<string, JsonValue>): string {
   }
 }
 
+export function hashCanonicalJson(
+  value: JsonValue | Record<string, JsonValue>,
+): string {
+  return hashRawEvidence(json(value));
+}
+
+const ACTION_PHASES = new Set<ActionLedgerPhase>([
+  'proposal',
+  'validation',
+  'authorization',
+  'dispatch',
+  'observation',
+  'reconciliation',
+  'canonical_commit',
+  'blocked',
+  'failed',
+  'cancelled',
+]);
+
+const TERMINAL_ACTION_PHASES = new Set<ActionLedgerPhase>([
+  'canonical_commit',
+  'blocked',
+  'failed',
+  'cancelled',
+]);
+
+const NEXT_ACTION_PHASE: Readonly<
+  Partial<Record<ActionLedgerPhase, ActionLedgerPhase>>
+> = {
+  proposal: 'validation',
+  validation: 'authorization',
+  authorization: 'dispatch',
+  dispatch: 'observation',
+  observation: 'reconciliation',
+  reconciliation: 'canonical_commit',
+};
+
+function actionPhase(value: unknown): ActionLedgerPhase {
+  if (
+    typeof value === 'string' &&
+    ACTION_PHASES.has(value as ActionLedgerPhase)
+  )
+    return value as ActionLedgerPhase;
+  throw new ArchiveStoreError(
+    'CORRUPT_DATABASE',
+    'Stored action ledger phase is invalid.',
+  );
+}
+
+function actionTransitionAllowed(
+  from: ActionLedgerPhase,
+  to: ActionLedgerPhase,
+): boolean {
+  if (TERMINAL_ACTION_PHASES.has(from)) return false;
+  if (to === 'blocked' || to === 'failed' || to === 'cancelled') return true;
+  return NEXT_ACTION_PHASE[from] === to;
+}
+
+interface RecordQueryCursor {
+  v: 1;
+  q: string;
+  c: string;
+  g: number;
+  k: { updatedAt: string; id: string };
+}
+
+function encodeRecordCursor(cursor: RecordQueryCursor): string {
+  return Buffer.from(
+    json(cursor as unknown as Record<string, JsonValue>),
+    'utf8',
+  ).toString('base64url');
+}
+
+function decodeRecordCursor(value: string): RecordQueryCursor {
+  if (
+    value.length < 1 ||
+    value.length > 4096 ||
+    !/^[A-Za-z0-9_-]+$/.test(value)
+  ) {
+    throw new ArchiveStoreError('INVALID_CURSOR', 'Archive cursor is invalid.');
+  }
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    ) as Partial<RecordQueryCursor>;
+    if (
+      parsed.v !== 1 ||
+      typeof parsed.q !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(parsed.q) ||
+      typeof parsed.c !== 'string' ||
+      !/^catalog_[a-f0-9]{32}$/.test(parsed.c) ||
+      !Number.isSafeInteger(parsed.g) ||
+      (parsed.g ?? 0) < 1 ||
+      !parsed.k ||
+      typeof parsed.k.updatedAt !== 'string' ||
+      !Number.isFinite(Date.parse(parsed.k.updatedAt)) ||
+      typeof parsed.k.id !== 'string' ||
+      !parsed.k.id
+    ) {
+      throw new Error('cursor_shape');
+    }
+    return parsed as RecordQueryCursor;
+  } catch (error) {
+    if (error instanceof ArchiveStoreError) throw error;
+    throw new ArchiveStoreError('INVALID_CURSOR', 'Archive cursor is invalid.');
+  }
+}
+
+const localArchiveAttestations = new WeakSet<object>();
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(child);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function archiveAttestationHash(input: {
+  record: StoredArchiveRecord;
+  catalogId: string;
+  catalogGeneration: number;
+}): string {
+  return hashCanonicalJson({
+    recordId: input.record.id,
+    sourceHash: input.record.sourceHash,
+    dataPolicy: input.record.dataPolicy,
+    externalProcessingAllowed: input.record.externalProcessingAllowed,
+    embargoUntil: input.record.embargoUntil,
+    catalogId: input.catalogId,
+    catalogGeneration: input.catalogGeneration,
+  });
+}
+
+export function isLocallyAttestedArchiveRecord(
+  attestation: AttestedArchiveRecord,
+): boolean {
+  return (
+    localArchiveAttestations.has(attestation) &&
+    attestation.kind === 'archive_record_attestation' &&
+    attestation.attestationHash === archiveAttestationHash(attestation)
+  );
+}
+
 function parseObject(value: unknown): Record<string, JsonValue> {
   if (typeof value !== 'string') return {};
   try {
@@ -740,25 +1124,123 @@ export class ArchiveStore {
 
   startSyncRun(input: SyncRunInput = {}): string {
     this.assertOpen();
-    const id = requiredText(input.id ?? `run_${randomUUID()}`, 'run.id');
-    const requested = input.requestedMaxRecords ?? null;
-    if (
-      requested !== null &&
-      (!Number.isSafeInteger(requested) || requested <= 0)
-    ) {
-      throw new ArchiveStoreError(
-        'INVALID_INPUT',
-        'requestedMaxRecords must be a positive integer.',
-      );
-    }
-    this.database
-      .prepare(
-        `INSERT INTO sync_runs
-          (id, started_at, status, requested_max_records, metadata_json)
-         VALUES (?, ?, 'running', ?, ?)`,
-      )
-      .run(id, iso(this.now()), requested, json(input.metadata ?? {}));
-    return id;
+    return this.insertSyncRun(input);
+  }
+
+  startAuthorizedSyncRun(input: AuthorizedSyncRunInput): {
+    runId: string;
+    actionId: string;
+  } {
+    this.assertOpen();
+    const actionId = requiredText(
+      input.actionId ?? `action_${randomUUID()}`,
+      'actionId',
+    );
+    const kind = requiredText(input.kind ?? 'archive_sync', 'action.kind', 128);
+    const target = requiredText(
+      input.target ?? input.connectorId,
+      'action.target',
+      512,
+    );
+    const connectorId = requiredText(
+      input.connectorId,
+      'action.connectorId',
+      128,
+    );
+    const connectorVersion = requiredText(
+      input.connectorVersion,
+      'action.connectorVersion',
+      128,
+    );
+    const policyVersion = requiredText(
+      input.policyVersion,
+      'action.policyVersion',
+      128,
+    );
+    const requestJson = json(input.request);
+    const inputHash = hashRawEvidence(requestJson);
+    const principal = requiredText(
+      input.authorization.principal,
+      'authorization.principal',
+      256,
+    );
+    const decisionCode = requiredText(
+      input.authorization.decisionCode,
+      'authorization.decisionCode',
+      256,
+    );
+    const scopeHash =
+      input.authorization.scopeHash ??
+      hashCanonicalJson({
+        kind,
+        target,
+        connectorId,
+        connectorVersion,
+        policyVersion,
+        inputHash,
+      });
+    assertSha256(scopeHash, 'authorization.scopeHash');
+
+    return this.transaction(() => {
+      const runId = this.insertSyncRun(input);
+      const occurredAt = iso(this.now());
+      const proposalPayload = { requestHash: inputHash };
+      const proposalPayloadJson = json(proposalPayload);
+      this.database
+        .prepare(
+          `INSERT INTO action_ledger_actions
+            (action_id, sync_run_id, kind, target, current_phase, sequence,
+             input_hash, policy_version, connector_id, connector_version,
+             request_json, context_json, terminal, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'proposal', 1, ?, ?, ?, ?, ?, '{}', 0, ?, ?)`,
+        )
+        .run(
+          actionId,
+          runId,
+          kind,
+          target,
+          inputHash,
+          policyVersion,
+          connectorId,
+          connectorVersion,
+          requestJson,
+          occurredAt,
+          occurredAt,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO action_ledger_events
+            (event_id, action_id, sync_run_id, sequence, from_phase, phase,
+             occurred_at, input_hash, policy_version, connector_id,
+             connector_version, payload_hash, payload_json)
+           VALUES (?, ?, ?, 1, NULL, 'proposal', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `event_${randomUUID()}`,
+          actionId,
+          runId,
+          occurredAt,
+          inputHash,
+          policyVersion,
+          connectorId,
+          connectorVersion,
+          hashRawEvidence(proposalPayloadJson),
+          proposalPayloadJson,
+        );
+      this.appendActionEventInTransaction(actionId, 'validation', {
+        valid: true,
+        inputHash,
+        connectorReadOnly: true,
+      });
+      this.appendActionEventInTransaction(actionId, 'authorization', {
+        allowed: true,
+        principal,
+        decisionCode,
+        scopeHash,
+        inputHash,
+      });
+      return { runId, actionId };
+    });
   }
 
   finishSyncRun(
@@ -767,6 +1249,17 @@ export class ArchiveStore {
     stopReason?: string,
   ): void {
     this.assertOpen();
+    const ledger = this.database
+      .prepare(
+        `SELECT 1 AS present FROM action_ledger_actions WHERE sync_run_id = ?`,
+      )
+      .get(requiredText(runId, 'runId')) as { present?: number } | undefined;
+    if (ledger) {
+      throw new ArchiveStoreError(
+        'ACTION_LEDGER_REQUIRED',
+        'Authorized sync runs must be settled atomically with their action ledger.',
+      );
+    }
     const result = this.database
       .prepare(
         `UPDATE sync_runs
@@ -785,6 +1278,217 @@ export class ArchiveStore {
         'Sync run does not exist or is already finished.',
       );
     }
+  }
+
+  advanceAction(
+    actionId: string,
+    phase: 'dispatch',
+    payload: Record<string, JsonValue> = {},
+  ): StoredActionLedgerEvent {
+    this.assertOpen();
+    if (phase !== 'dispatch') {
+      throw new ArchiveStoreError('INVALID_INPUT', 'Action phase is invalid.');
+    }
+    return this.transaction(() =>
+      this.appendActionEventInTransaction(actionId, phase, payload),
+    );
+  }
+
+  settleSyncRunAction(
+    input: SettleSyncRunActionInput,
+  ): StoredActionLedgerAction {
+    this.assertOpen();
+    const runId = requiredText(input.runId, 'runId');
+    return this.transaction(() => {
+      const run = this.database
+        .prepare(
+          `SELECT id, status, records_committed FROM sync_runs WHERE id = ?`,
+        )
+        .get(runId) as Record<string, unknown> | undefined;
+      if (run?.status !== 'running') {
+        throw new ArchiveStoreError(
+          'RUN_NOT_ACTIVE',
+          'Sync run does not exist or is already finished.',
+        );
+      }
+      const actionRow = this.database
+        .prepare(
+          `SELECT * FROM action_ledger_actions WHERE sync_run_id = ? LIMIT 1`,
+        )
+        .get(runId) as Record<string, unknown> | undefined;
+      if (!actionRow) {
+        throw new ArchiveStoreError(
+          'ACTION_NOT_FOUND',
+          'Sync run has no durable action ledger.',
+        );
+      }
+      const actionId = String(actionRow.action_id);
+      let currentPhase = actionPhase(actionRow.current_phase);
+      if (currentPhase === 'dispatch') {
+        this.appendActionEventInTransaction(actionId, 'observation', {
+          ...(input.observation ?? {}),
+          status: input.status,
+          stopReason: input.stopReason ?? null,
+        });
+        currentPhase = 'observation';
+      }
+
+      if (input.status === 'completed') {
+        if (currentPhase !== 'observation') {
+          throw new ArchiveStoreError(
+            'INVALID_ACTION_TRANSITION',
+            'A completed sync run must be observed before reconciliation.',
+          );
+        }
+        const recordsCommitted = Number(run.records_committed);
+        const workerCommitted = input.reconciliation?.workerCommitted;
+        if (
+          typeof workerCommitted !== 'number' ||
+          !Number.isSafeInteger(workerCommitted) ||
+          workerCommitted < 0
+        ) {
+          throw new ArchiveStoreError(
+            'INVALID_RECONCILIATION',
+            'Successful runs require an integer workerCommitted count.',
+          );
+        }
+        if (workerCommitted !== recordsCommitted) {
+          throw new ArchiveStoreError(
+            'RECONCILIATION_MISMATCH',
+            `Worker reported ${workerCommitted} commits; SQLite recorded ${recordsCommitted}.`,
+          );
+        }
+        const commitRows = this.database
+          .prepare(
+            `SELECT record_id, source_hash, disposition
+             FROM sync_record_commits
+             WHERE sync_run_id = ? AND disposition <> 'unchanged'
+             ORDER BY record_id ASC, source_hash ASC, disposition ASC`,
+          )
+          .all(runId) as Record<string, unknown>[];
+        const recordSet = commitRows.map((row) => ({
+          recordId: String(row.record_id),
+          sourceHash: String(row.source_hash),
+          disposition: String(row.disposition),
+        }));
+        if (recordSet.length !== recordsCommitted) {
+          throw new ArchiveStoreError(
+            'RECONCILIATION_MISMATCH',
+            'Canonical record links do not match the sync run counter.',
+          );
+        }
+        const recordSetHash = hashCanonicalJson(recordSet);
+        this.appendActionEventInTransaction(actionId, 'reconciliation', {
+          ...(input.reconciliation ?? {}),
+          recordsCommitted,
+          recordSetHash,
+        });
+        const commitSetHash = hashCanonicalJson({
+          actionId,
+          runId,
+          recordsCommitted,
+          recordSetHash,
+        });
+        this.appendActionEventInTransaction(actionId, 'canonical_commit', {
+          syncRunId: runId,
+          recordsCommitted,
+          recordSetHash,
+          commitSetHash,
+        });
+      } else {
+        const terminalPhase: 'blocked' | 'failed' | 'cancelled' =
+          input.status === 'failed'
+            ? 'failed'
+            : (input.terminalPhase ?? 'blocked');
+        if (input.status === 'stopped' && terminalPhase === 'failed') {
+          throw new ArchiveStoreError(
+            'INVALID_INPUT',
+            'A stopped run must settle as blocked or cancelled.',
+          );
+        }
+        this.appendActionEventInTransaction(actionId, terminalPhase, {
+          status: input.status,
+          stopReason: input.stopReason ?? null,
+        });
+      }
+
+      const result = this.database
+        .prepare(
+          `UPDATE sync_runs
+           SET completed_at = ?, status = ?, stop_reason = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(iso(this.now()), input.status, input.stopReason ?? null, runId);
+      if (Number(result.changes) !== 1) {
+        throw new ArchiveStoreError(
+          'RUN_NOT_ACTIVE',
+          'Sync run was concurrently settled.',
+        );
+      }
+      const settled = this.database
+        .prepare(`SELECT * FROM action_ledger_actions WHERE action_id = ?`)
+        .get(actionId) as Record<string, unknown>;
+      return this.actionFromRow(settled);
+    });
+  }
+
+  getAction(actionId: string): StoredActionLedgerAction | null {
+    this.assertOpen();
+    const row = this.database
+      .prepare(`SELECT * FROM action_ledger_actions WHERE action_id = ?`)
+      .get(requiredText(actionId, 'actionId')) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.actionFromRow(row) : null;
+  }
+
+  getActionForRun(runId: string): StoredActionLedgerAction | null {
+    this.assertOpen();
+    const row = this.database
+      .prepare(`SELECT * FROM action_ledger_actions WHERE sync_run_id = ?`)
+      .get(requiredText(runId, 'runId')) as Record<string, unknown> | undefined;
+    return row ? this.actionFromRow(row) : null;
+  }
+
+  listActionEvents(actionId: string): StoredActionLedgerEvent[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM action_ledger_events
+         WHERE action_id = ? ORDER BY sequence ASC`,
+      )
+      .all(requiredText(actionId, 'actionId')) as Record<string, unknown>[];
+    return rows.map((row) => this.actionEventFromRow(row));
+  }
+
+  listSyncRecordCommits(runId: string): StoredSyncRecordCommit[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM sync_record_commits
+         WHERE sync_run_id = ? ORDER BY committed_at ASC, id ASC`,
+      )
+      .all(requiredText(runId, 'runId')) as Record<string, unknown>[];
+    return rows.map((row) => {
+      const recordType =
+        row.record_type === 'submission' ? 'submission' : 'chat';
+      const disposition =
+        row.disposition === 'updated'
+          ? 'updated'
+          : row.disposition === 'unchanged'
+            ? 'unchanged'
+            : 'inserted';
+      return {
+        id: String(row.id),
+        syncRunId: String(row.sync_run_id),
+        actionId: nullableString(row.action_id),
+        recordId: String(row.record_id),
+        recordType,
+        sourceHash: String(row.source_hash),
+        disposition,
+        committedAt: String(row.committed_at),
+      };
+    });
   }
 
   commitRecord(input: CommitRecordInput): CommitRecordResult {
@@ -832,6 +1536,29 @@ export class ArchiveStore {
               'Cannot commit a record to an inactive sync run.',
             );
           }
+          const action = this.database
+            .prepare(
+              `SELECT action_id FROM action_ledger_actions
+               WHERE sync_run_id = ? LIMIT 1`,
+            )
+            .get(input.runId) as { action_id?: unknown } | undefined;
+          this.database
+            .prepare(
+              `INSERT INTO sync_record_commits
+                (id, sync_run_id, action_id, record_id, record_type,
+                 source_hash, disposition, committed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              `record_commit_${randomUUID()}`,
+              input.runId,
+              typeof action?.action_id === 'string' ? action.action_id : null,
+              recordId,
+              input.record.kind,
+              sourceHash,
+              disposition,
+              now,
+            );
           if (disposition !== 'unchanged') {
             this.database
               .prepare(
@@ -908,6 +1635,132 @@ export class ArchiveStore {
       unknown
     >[];
     return rows.map((row) => this.summaryFromRow(row));
+  }
+
+  queryRecords(options: RecordQueryOptions = {}): RecordQueryPage {
+    this.assertOpen();
+    if (
+      options.kind !== undefined &&
+      options.kind !== 'chat' &&
+      options.kind !== 'submission'
+    ) {
+      throw new ArchiveStoreError(
+        'INVALID_INPUT',
+        'Unknown archive record kind.',
+      );
+    }
+    const { limit } = pageBounds(options.limit, 0);
+    const platform = options.platform
+      ? requiredText(options.platform, 'platform', 256)
+      : null;
+    const queryHash = hashCanonicalJson({
+      kind: options.kind ?? null,
+      platform,
+      sort: 'updated_at_desc_id_asc_v1',
+    });
+    const cursor = options.cursor
+      ? decodeRecordCursor(requiredText(options.cursor, 'cursor', 4096))
+      : null;
+    if (cursor && cursor.q !== queryHash) {
+      throw new ArchiveStoreError(
+        'QUERY_CURSOR_MISMATCH',
+        'Archive cursor belongs to a different query.',
+      );
+    }
+
+    return this.readTransaction(() => {
+      const generationRow = this.database
+        .prepare(
+          `SELECT catalog_id, generation
+           FROM archive_catalog_state WHERE singleton = 1`,
+        )
+        .get() as
+        | { catalog_id?: unknown; generation?: number | bigint }
+        | undefined;
+      const catalogId = String(generationRow?.catalog_id ?? '');
+      const catalogGeneration = Number(generationRow?.generation ?? 0);
+      if (
+        !/^catalog_[a-f0-9]{32}$/.test(catalogId) ||
+        !Number.isSafeInteger(catalogGeneration) ||
+        catalogGeneration < 1
+      ) {
+        throw new ArchiveStoreError(
+          'CORRUPT_DATABASE',
+          'Archive catalog generation is invalid.',
+        );
+      }
+      if (
+        cursor &&
+        (cursor.c !== catalogId || cursor.g !== catalogGeneration)
+      ) {
+        throw new ArchiveStoreError(
+          'STALE_QUERY_CURSOR',
+          'Archive catalog changed; restart this query without the old cursor.',
+        );
+      }
+
+      const sourceSql =
+        options.kind === 'chat'
+          ? `SELECT id, 'chat' AS kind, platform,
+                    external_chat_id AS external_id, source_hash, data_policy,
+                    external_processing_allowed, embargo_until, first_seen_at,
+                    updated_at
+             FROM chats`
+          : options.kind === 'submission'
+            ? `SELECT id, 'submission' AS kind, platform,
+                      external_submission_id AS external_id, source_hash,
+                      data_policy, external_processing_allowed, embargo_until,
+                      first_seen_at, updated_at
+               FROM submissions`
+            : `SELECT id, 'chat' AS kind, platform,
+                      external_chat_id AS external_id, source_hash, data_policy,
+                      external_processing_allowed, embargo_until, first_seen_at,
+                      updated_at
+               FROM chats
+               UNION ALL
+               SELECT id, 'submission' AS kind, platform,
+                      external_submission_id AS external_id, source_hash,
+                      data_policy, external_processing_allowed, embargo_until,
+                      first_seen_at, updated_at
+               FROM submissions`;
+      const predicates: string[] = [];
+      const parameters: Array<string | number> = [];
+      if (platform) {
+        predicates.push('platform = ?');
+        parameters.push(platform);
+      }
+      if (cursor) {
+        predicates.push('(updated_at < ? OR (updated_at = ? AND id > ?))');
+        parameters.push(cursor.k.updatedAt, cursor.k.updatedAt, cursor.k.id);
+      }
+      const where = predicates.length
+        ? `WHERE ${predicates.join(' AND ')}`
+        : '';
+      const rows = this.database
+        .prepare(
+          `SELECT * FROM (${sourceSql}) ${where}
+           ORDER BY updated_at DESC, id ASC LIMIT ?`,
+        )
+        .all(...parameters, limit + 1) as Record<string, unknown>[];
+      const hasNext = rows.length > limit;
+      const pageRows = hasNext ? rows.slice(0, limit) : rows;
+      const last = pageRows.at(-1);
+      return {
+        items: pageRows.map((row) => this.summaryFromRow(row)),
+        nextCursor:
+          hasNext && last
+            ? encodeRecordCursor({
+                v: 1,
+                q: queryHash,
+                c: catalogId,
+                g: catalogGeneration,
+                k: { updatedAt: String(last.updated_at), id: String(last.id) },
+              })
+            : null,
+        queryHash,
+        catalogGeneration,
+      };
+    });
   }
 
   getRecordById(recordId: string): StoredArchiveRecord | null {
@@ -1026,6 +1879,45 @@ export class ArchiveStore {
     return typeof row?.id === 'string' && row.id
       ? this.getRecordById(row.id)
       : null;
+  }
+
+  attestRecord(recordId: string): AttestedArchiveRecord | null {
+    this.assertOpen();
+    return this.readTransaction(() => {
+      const record = this.getRecordById(recordId);
+      if (!record) return null;
+      const catalog = this.database
+        .prepare(
+          `SELECT catalog_id, generation
+           FROM archive_catalog_state WHERE singleton = 1`,
+        )
+        .get() as Record<string, unknown> | undefined;
+      const catalogId = String(catalog?.catalog_id ?? '');
+      const catalogGeneration = Number(catalog?.generation ?? 0);
+      if (
+        !/^catalog_[a-f0-9]{32}$/.test(catalogId) ||
+        !Number.isSafeInteger(catalogGeneration) ||
+        catalogGeneration < 1
+      ) {
+        throw new ArchiveStoreError(
+          'CORRUPT_DATABASE',
+          'Archive catalog identity is invalid.',
+        );
+      }
+      const value = deepFreeze({
+        kind: 'archive_record_attestation' as const,
+        record,
+        catalogId,
+        catalogGeneration,
+        attestationHash: archiveAttestationHash({
+          record,
+          catalogId,
+          catalogGeneration,
+        }),
+      });
+      localArchiveAttestations.add(value);
+      return value;
+    });
   }
 
   stats(): ArchiveStoreStats {
@@ -1224,6 +2116,166 @@ export class ArchiveStore {
       );
   }
 
+  private insertSyncRun(input: SyncRunInput): string {
+    const id = requiredText(input.id ?? `run_${randomUUID()}`, 'run.id');
+    const requested = input.requestedMaxRecords ?? null;
+    if (
+      requested !== null &&
+      (!Number.isSafeInteger(requested) || requested <= 0)
+    ) {
+      throw new ArchiveStoreError(
+        'INVALID_INPUT',
+        'requestedMaxRecords must be a positive integer.',
+      );
+    }
+    this.database
+      .prepare(
+        `INSERT INTO sync_runs
+          (id, started_at, status, requested_max_records, metadata_json)
+         VALUES (?, ?, 'running', ?, ?)`,
+      )
+      .run(id, iso(this.now()), requested, json(input.metadata ?? {}));
+    return id;
+  }
+
+  private appendActionEventInTransaction(
+    actionId: string,
+    phase: ActionLedgerPhase,
+    payload: Record<string, JsonValue>,
+  ): StoredActionLedgerEvent {
+    const id = requiredText(actionId, 'actionId');
+    const row = this.database
+      .prepare(`SELECT * FROM action_ledger_actions WHERE action_id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new ArchiveStoreError(
+        'ACTION_NOT_FOUND',
+        'Durable action does not exist.',
+      );
+    }
+    const fromPhase = actionPhase(row.current_phase);
+    if (!actionTransitionAllowed(fromPhase, phase)) {
+      throw new ArchiveStoreError(
+        'INVALID_ACTION_TRANSITION',
+        `Action cannot transition from ${fromPhase} to ${phase}.`,
+      );
+    }
+    const sequence = Number(row.sequence) + 1;
+    if (!Number.isSafeInteger(sequence) || sequence < 2) {
+      throw new ArchiveStoreError(
+        'CORRUPT_DATABASE',
+        'Action ledger sequence is invalid.',
+      );
+    }
+    const occurredAt = iso(this.now());
+    const payloadJson = json(payload);
+    const eventId = `event_${randomUUID()}`;
+    this.database
+      .prepare(
+        `INSERT INTO action_ledger_events
+          (event_id, action_id, sync_run_id, sequence, from_phase, phase,
+           occurred_at, input_hash, policy_version, connector_id,
+           connector_version, payload_hash, payload_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        eventId,
+        id,
+        String(row.sync_run_id),
+        sequence,
+        fromPhase,
+        phase,
+        occurredAt,
+        String(row.input_hash),
+        String(row.policy_version),
+        String(row.connector_id),
+        String(row.connector_version),
+        hashRawEvidence(payloadJson),
+        payloadJson,
+      );
+    const update = this.database
+      .prepare(
+        `UPDATE action_ledger_actions
+         SET current_phase = ?, sequence = ?, terminal = ?, updated_at = ?
+         WHERE action_id = ? AND current_phase = ? AND sequence = ?`,
+      )
+      .run(
+        phase,
+        sequence,
+        TERMINAL_ACTION_PHASES.has(phase) ? 1 : 0,
+        occurredAt,
+        id,
+        fromPhase,
+        Number(row.sequence),
+      );
+    if (Number(update.changes) !== 1) {
+      throw new ArchiveStoreError(
+        'ACTION_CONFLICT',
+        'Action ledger changed concurrently.',
+      );
+    }
+    return {
+      eventId,
+      actionId: id,
+      syncRunId: String(row.sync_run_id),
+      sequence,
+      fromPhase,
+      phase,
+      occurredAt,
+      inputHash: String(row.input_hash),
+      policyVersion: String(row.policy_version),
+      connectorId: String(row.connector_id),
+      connectorVersion: String(row.connector_version),
+      payloadHash: hashRawEvidence(payloadJson),
+      payload: parseObject(payloadJson),
+    };
+  }
+
+  private actionFromRow(
+    row: Record<string, unknown>,
+  ): StoredActionLedgerAction {
+    return {
+      actionId: String(row.action_id),
+      syncRunId: String(row.sync_run_id),
+      kind: String(row.kind),
+      target: String(row.target),
+      currentPhase: actionPhase(row.current_phase),
+      sequence: Number(row.sequence),
+      inputHash: String(row.input_hash),
+      policyVersion: String(row.policy_version),
+      connectorId: String(row.connector_id),
+      connectorVersion: String(row.connector_version),
+      request: parseObject(row.request_json),
+      context: parseObject(row.context_json),
+      terminal: Number(row.terminal) === 1,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private actionEventFromRow(
+    row: Record<string, unknown>,
+  ): StoredActionLedgerEvent {
+    return {
+      eventId: String(row.event_id),
+      actionId: String(row.action_id),
+      syncRunId: String(row.sync_run_id),
+      sequence: Number(row.sequence),
+      fromPhase:
+        row.from_phase === null || row.from_phase === undefined
+          ? null
+          : actionPhase(row.from_phase),
+      phase: actionPhase(row.phase),
+      occurredAt: String(row.occurred_at),
+      inputHash: String(row.input_hash),
+      policyVersion: String(row.policy_version),
+      connectorId: String(row.connector_id),
+      connectorVersion: String(row.connector_version),
+      payloadHash: String(row.payload_hash),
+      payload: parseObject(row.payload_json),
+    };
+  }
+
   private assertOpen(): void {
     if (this.closed)
       throw new ArchiveStoreError('STORE_CLOSED', 'Archive store is closed.');
@@ -1315,6 +2367,22 @@ export class ArchiveStore {
         this.database.exec('ROLLBACK');
       } catch {
         // Preserve the original error.
+      }
+      throw error;
+    }
+  }
+
+  private readTransaction<T>(work: () => T): T {
+    this.database.exec('BEGIN');
+    try {
+      const value = work();
+      this.database.exec('COMMIT');
+      return value;
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // Preserve the original read error.
       }
       throw error;
     }

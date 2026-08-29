@@ -3,6 +3,14 @@ import type {
   CredentialExecutor,
   OpaqueCredentialHandle,
 } from '../../auth-broker/src/index';
+import {
+  isLocallyGeneratedAuthorizedProjection,
+  projectionMessages,
+  type AuthorizedModelProjection,
+  type ProjectionRecordPolicy,
+} from './projection.js';
+
+export * from './projection.js';
 
 export type DataPolicy =
   | 'local_only'
@@ -31,12 +39,7 @@ export type ProviderRoute = {
   additionalBody?: Readonly<Record<string, unknown>>;
 };
 
-export type RecordPolicy = {
-  level: DataPolicy;
-  externalProcessingAllowed: boolean;
-  embargoUntil: string | null;
-  redactionVersion: string;
-};
+export type RecordPolicy = ProjectionRecordPolicy;
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant';
@@ -46,10 +49,8 @@ export type ChatMessage = {
 export type CompletionRequest = {
   task: ModelTask;
   routeId: string;
-  recordPolicy: RecordPolicy;
-  messages: readonly ChatMessage[];
-  /** Router routes require an explicit redacted analysis copy. */
-  redacted: boolean;
+  /** Only a locally generated, hash-verified projection may reach a provider. */
+  projection: AuthorizedModelProjection;
   temperature?: number;
   maxTokens?: number;
   responseFormat?: 'text' | 'json_object';
@@ -69,7 +70,7 @@ export type RouteDecision =
 
 export function authorizeRoute(
   route: ProviderRoute,
-  request: Pick<CompletionRequest, 'task' | 'recordPolicy' | 'redacted'>,
+  request: Pick<CompletionRequest, 'task' | 'projection'>,
   now = new Date(),
 ): RouteDecision {
   if (!route.enabled) {
@@ -78,36 +79,47 @@ export function authorizeRoute(
   if (!route.allowedTasks.includes(request.task)) {
     return { allowed: false, reason: 'task_not_allowed_on_route' };
   }
-  if (request.recordPolicy.level === 'local_only') {
+  if (!isLocallyGeneratedAuthorizedProjection(request.projection)) {
+    return { allowed: false, reason: 'projection_not_locally_authorized' };
+  }
+  const recordPolicy = request.projection.authorization.policy;
+  if (
+    !new Set<DataPolicy>([
+      'local_only',
+      'direct_provider_only',
+      'zdr_router_allowed',
+      'public',
+    ]).has(recordPolicy.level)
+  ) {
+    return { allowed: false, reason: 'unknown_record_policy' };
+  }
+  if (recordPolicy.level === 'local_only') {
     return { allowed: false, reason: 'record_is_local_only' };
   }
-  if (!request.recordPolicy.externalProcessingAllowed) {
+  if (!recordPolicy.externalProcessingAllowed) {
     return { allowed: false, reason: 'external_processing_not_allowed' };
   }
-  if (request.recordPolicy.embargoUntil) {
-    const embargo = new Date(request.recordPolicy.embargoUntil);
+  if (recordPolicy.embargoUntil) {
+    const embargo = new Date(recordPolicy.embargoUntil);
     if (!Number.isFinite(embargo.getTime()) || embargo > now) {
       return { allowed: false, reason: 'record_embargo_active' };
     }
   }
   if (
-    request.recordPolicy.level === 'direct_provider_only' &&
+    recordPolicy.level === 'direct_provider_only' &&
     route.kind !== 'direct'
   ) {
     return { allowed: false, reason: 'router_disallowed_by_record_policy' };
   }
   if (route.kind === 'router') {
     if (
-      request.recordPolicy.level !== 'zdr_router_allowed' &&
-      request.recordPolicy.level !== 'public'
+      recordPolicy.level !== 'zdr_router_allowed' &&
+      recordPolicy.level !== 'public'
     ) {
       return { allowed: false, reason: 'router_disallowed_by_record_policy' };
     }
     if (!route.zeroDataRetention || route.promptLogging) {
       return { allowed: false, reason: 'router_privacy_requirements_not_met' };
-    }
-    if (!request.redacted) {
-      return { allowed: false, reason: 'router_requires_redacted_copy' };
     }
   }
 
@@ -130,6 +142,29 @@ export class ModelRouter {
     auth: AuthBroker & CredentialExecutor;
     fetchImpl?: typeof fetch;
   }) {
+    const protectedBodyKeys = new Set([
+      'model',
+      'messages',
+      'temperature',
+      'max_tokens',
+      'response_format',
+    ]);
+    for (const route of options.routes) {
+      for (const key of Object.keys(route.additionalBody ?? {})) {
+        if (protectedBodyKeys.has(key)) {
+          throw new Error(
+            `Model route ${route.id} cannot override protected body field: ${key}`,
+          );
+        }
+      }
+      for (const key of Object.keys(route.additionalHeaders ?? {})) {
+        if (['authorization', 'content-type'].includes(key.toLowerCase())) {
+          throw new Error(
+            `Model route ${route.id} cannot override protected header: ${key}`,
+          );
+        }
+      }
+    }
     this.#routes = new Map(options.routes.map((route) => [route.id, route]));
     this.#auth = options.auth;
     this.#fetch = options.fetchImpl ?? fetch;
@@ -167,15 +202,15 @@ export class ModelRouter {
             ...route.additionalHeaders,
           },
           body: JSON.stringify({
+            ...route.additionalBody,
             model: route.model,
-            messages: request.messages,
+            messages: projectionMessages(request.projection),
             temperature: request.temperature ?? 0,
             max_tokens: request.maxTokens,
             response_format:
               request.responseFormat === 'json_object'
                 ? { type: 'json_object' }
                 : undefined,
-            ...route.additionalBody,
           }),
           signal: AbortSignal.timeout(60_000),
         },

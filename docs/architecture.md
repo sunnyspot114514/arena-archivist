@@ -1,83 +1,116 @@
 # Arena Archivist architecture
 
-Arena Archivist is a localhost-only personal archive and replay runtime for records the user is already authorized to view. The first release has one site adapter, one visible browser, one active tab, and no submission capability.
+Arena Archivist is a localhost-only personal archive and replay runtime for records the user is already authorized to view. `D:\Agent` is the only product and canonical codebase. The first connector is Gray Swan; collection is read-only, manually started, single-concurrency, and has no submission capability.
 
 ## Trust boundaries
 
 ```text
 User
-  │ manually starts a batch / completes login
+  │ manual login / bounded loopback semantic request
   ▼
-Dashboard (localhost)
-  │ semantic commands only
-  ▼
-Runtime API ── Archive Store ── raw evidence + SQLite + checkpoint
+Dashboard or DSH (localhost semantic operations only)
   │
-  ├── Browser Guardian ── policy audit log
-  ├── Rate Governor ───── bounded batch budget
-  └── Gray Swan Adapter ─ deterministic parser/state machine
-                              │
-                              ▼
-                     Playwright persistent context
-                              │
-                              ▼
-                    dedicated Chrome profile
+  ▼
+Runtime API
+  ├── ArchiveConnectorRegistry ── Gray Swan connector metadata + typed adapter
+  ├── Action ledger ───────────── run/action authorization and terminal history
+  ├── Archive store ───────────── normalized SQLite + immutable evidence
+  ├── Browser Guardian ────────── semantic, DOM, and network denial policy
+  ├── Rate Governor ───────────── bounded batch budget
+  └── Model projection gate ───── deterministic local redaction + hash verification
+                                      │
+                                      ▼
+                           existing GraySwanBrowserWorker
+                                      │
+                                      ▼
+                           dedicated browser profile
 ```
 
-The model-facing surface never receives Playwright primitives. It only exposes four bounded operations: session status, sync the next batch, read an archived record, and export an analysis pack.
+The connector registry does not execute a generic browser. Registration runtime-validates IDs, declared capabilities, duplicate fields, and `readOnly: true`; `get()`/`list()` retain only a frozen metadata facade. The controller uses the typed instance returned by successful Gray Swan registration. The existing Gray Swan worker remains the only collection executor and owns its narrow `CollectBrowserPort`; neither DSH nor the model router receives Playwright, DOM handles, cookies, storage state, or arbitrary URLs.
 
 ## Runtime modes
 
-- `AUTH_MODE`: opens a dedicated visible Chrome profile. The user alone controls identity-provider pages, passkeys, CAPTCHA, and MFA. No model tools are active.
-- `COLLECT_MODE`: permits navigation only to configured Gray Swan origins and required static origins. Writing into controls, uploads, GraphQL mutations, and unknown state-changing requests are denied.
-- `PAUSED_HUMAN_AUTH`: terminal state for a batch when the session is missing or a human challenge appears.
-- `DEMO_MODE`: runs the exact parse, validate, commit, and checkpoint path against local fixtures without contacting Gray Swan.
+- `AUTH_MODE`: launches the dedicated visible system browser. The user alone controls identity-provider pages, passkeys, CAPTCHA, and MFA. No model browser tools are active.
+- `COLLECT_MODE`: permits navigation only to configured Gray Swan and required static origins. Writes to controls, uploads, GraphQL mutations, and unknown state-changing requests are denied.
+- `PAUSED_HUMAN_AUTH`: the idle/handoff state when a session is missing or human action is required.
+- `DEMO_MODE`: runs the same parse, validate, record commit, and ledger path against repository fixtures without contacting Gray Swan.
 
-## Collection state machine
+## Worker state and durable action state
+
+The existing record worker keeps its deliberately narrow state machine:
 
 ```text
-AUTH_CHECK
-  → INDEX_DISCOVERY
-  → OPEN_RECORD
-  → CAPTURE_RAW
-  → PARSE
-  → VALIDATE
-  → COMMIT
-  → COOLDOWN
-  → NEXT_RECORD
+AUTH_CHECK → INDEX_DISCOVERY → OPEN_RECORD → CAPTURE_RAW
+           → PARSE → VALIDATE → COMMIT → COOLDOWN → NEXT_RECORD
 ```
 
-Every transition is explicit and auditable. `COMMIT` writes normalized fields and provenance in a single SQLite transaction. The checkpoint is advanced only after that transaction succeeds. A repeated batch is therefore idempotent.
+Every manually requested sync run also has one durable action in SQLite:
+
+```text
+proposal → validation → authorization → dispatch → observation
+         → reconciliation → canonical_commit
+
+any non-terminal phase → blocked | failed | cancelled
+```
+
+`action_ledger_events` is append-only and sequences events by `(action_id, sequence)`. Every event also carries `sync_run_id`, input hash, payload hash, connector ID/version, and policy version. `action_ledger_actions` is a current-state index; it is not a replacement for the event history.
+
+On a successful run, observation, reconciliation, canonical action commit, and the terminal `sync_runs` update are written in one SQLite transaction. A stopped or failed run writes its explicit terminal action phase with the run terminal state. Startup recovery marks a formerly running action failed with `process_restarted` rather than blindly redispatching it.
+
+Individual records are still committed as they pass worker validation. Each record, its evidence references, `sync_record_commits` run/action link, run counter, and checkpoint advance form one atomic canonical-record transaction. Successful reconciliation requires the worker count, SQLite run counter, and linked non-unchanged record set to agree; the ledger stores a deterministic `recordSetHash` and `commitSetHash`. A mismatch rolls back observation/reconciliation and is settled as a failed action. The run-level `canonical_commit` attests that the resulting batch was observed and reconciled; it does not postpone already durable per-record commits.
 
 ## Canonical data and recovery
 
-`arena-archivist-data/normalized/arena.sqlite` is canonical for normalized records. Raw HTML, visible text, and allowed response payloads are immutable evidence addressed by SHA-256. `checkpoints/crawler_state.json` is a recovery handle, not a second database.
+`arena-archivist-data/normalized/arena.sqlite` is canonical for normalized records, checkpoints, sync runs, policy decisions, catalog generation, and the action ledger. Raw HTML and visible-text evidence is immutable and content-addressed by SHA-256 under the configured evidence directory.
 
-If a process exits between capture and commit, the temporary evidence directory is discarded on restart. If it exits after commit but before the next record opens, the checkpoint and unique constraints prevent a duplicate.
+If capture or parsing fails before `commitRecord`, no checkpoint advances. If a database operation fails after a newly created evidence file is written, compensation removes the unreferenced file. If the process exits after a record commit, the SQLite checkpoint and unique constraints make replay idempotent. Rate-governor JSON is separate operational budget state, not a second archive or crawler checkpoint.
 
-## Model routing
+## Stable archive queries
 
-Browsing succeeds without an LLM. Model calls are only available to offline analysis and parser-repair proposals. Before each call the router checks the record data policy:
+`GET /v1/records/query` uses keyset pagination ordered by `updated_at DESC, id ASC`. A cursor is opaque and contains only a version, canonical query hash, persistent random catalog ID, catalog generation, and the last ordering key. The runtime:
 
-- `local_only`: no external model call.
-- `direct_provider_only`: only explicitly approved direct providers.
-- `zdr_router_allowed`: approved direct providers or an explicitly configured zero-data-retention router.
-- `public`: any configured and approved route.
+1. normalizes the query and recomputes its SHA-256 hash;
+2. rejects a cursor from another query with `QUERY_CURSOR_MISMATCH`;
+3. compares catalog ID and generation with transactional `archive_catalog_state` and returns `STALE_QUERY_CURSOR` after database replacement or canonical chats/submissions change;
+4. applies `updated_at < last_updated_at OR (updated_at = last_updated_at AND id > last_id)` rather than OFFSET.
 
-Parser repair output is a proposal. It must pass fixture tests and human review before becoming the active selector contract.
+`GET /v1/records?limit=&offset=` remains a compatibility API. New DSH and Dashboard paths use the cursor API.
 
-## Local API
+## Deterministic model projections
 
-The runtime listens on `127.0.0.1` only. The initial API is intentionally small:
+Browsing and archival do not require an LLM. A provider request can only carry an `AuthorizedModelProjection` produced locally from a stored record:
+
+- the payload is a fixed allowlist of record summary, messages, judge results, selected attributes, and hash-only provenance;
+- email, phone, credential/token, private-key, and URL patterns are deterministically replaced;
+- remote IDs, source URLs, selector traces, evidence paths, and artifact metadata are omitted;
+- the projection carries `sourceHash`, `policyVersion`, and `projectionHash`;
+- authorization carries the stored data policy plus `policyHash` and `authorizationHash`;
+- the generator requires a deep-frozen, module-branded attestation read from the current `ArchiveStore`; plain caller-authored records are rejected;
+- a second module-private projection brand and hash recomputation reject serialized, cloned, tampered, or caller-authored projections.
+
+The model router no longer accepts caller messages, a caller-supplied record policy, or `redacted: true`. It builds a fixed instruction and serialized verified projection itself, then applies `local_only`, external-processing, embargo, direct-provider, and ZDR/logging gates.
+
+## Model-facing tools and local API
+
+The DSH profile has a monotonic allowlist of five tools: status, start a bounded sync, cursor-query content-free archive handles, read a content-free projection receipt, and export an analysis pack. Every runtime response passes an explicit field reducer: checkpoint cursors, titles/outcomes, projection payloads, absolute export paths, and unknown fields are discarded. It has no generic web, shell, filesystem, editor, workflow, scheduler, subagent, or Playwright tool.
+
+Relevant runtime endpoints are:
 
 - `GET /v1/status`
 - `POST /v1/auth/open`
 - `POST /v1/session/validate`
 - `POST /v1/sync`
 - `POST /v1/pause`
-- `GET /v1/records`
+- `GET /v1/records` (offset compatibility)
+- `GET /v1/records/query` (stable cursor API)
+- `GET /v1/records/:id/projection` (content-free projection receipt)
+- `GET /v1/actions/:id`
+- `GET /v1/policy/events`
 - `POST /v1/analyze`
 - `POST /v1/export`
-- `GET /v1/policy/events`
 
-All write-shaped API calls change only local runtime state. None can submit, edit, or delete data on Gray Swan.
+All write-shaped API calls change only local runtime state. None can submit, edit, or delete Gray Swan data.
+
+## Absorbed donor
+
+The useful concepts from `D:\devspace\projects\web-archive-agent` were reimplemented in this TypeScript/SQLite architecture. Its JSONL/Map ledger, offset-style cursor, caller-configurable projection, and standalone JavaScript collector were not copied. The donor is no longer an active product or runtime dependency and can be archived as read-only historical reference.

@@ -1,5 +1,6 @@
 # dependencies
 /node_modules
+**/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -13,7 +14,9 @@
 
 # next.js
 /.next/
+**/.next/
 /.vinext/
+**/.vinext/
 /out/
 
 # misc
@@ -33,15 +36,28 @@ yarn-error.log*
 # local databases and compiler caches
 *.sqlite
 *.sqlite-*
+*.sqlite3
+*.sqlite3-*
 *.db
 *.db-*
+*.db3
+*.db3-*
 *.tsbuildinfo
+*.key
+*.p12
+*.pfx
+*.log
+.dev.vars*
+!.dev.vars.example
+**/.cache/
 
 # deployment and generated files
 .vercel
 next-env.d.ts
 /dist/
+**/dist/
 /.wrangler/
+**/.wrangler/
 /outputs/
 /work/
 

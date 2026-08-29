@@ -15,6 +15,7 @@ import {
   ArchiveStore,
   StaleCheckpointError,
   archiveSchema,
+  hashCanonicalJson,
   hashRawEvidence,
   resolveEvidencePath,
 } from './index.ts';
@@ -90,7 +91,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
     const first = store.commitRecord(input);
     const retry = store.commitRecord(input);
 
-    assert.equal(archiveSchema.latestVersion, 2);
+    assert.equal(archiveSchema.latestVersion, 3);
     assert.equal(first.disposition, 'inserted');
     assert.equal(retry.disposition, 'unchanged');
     assert.equal(first.recordId, retry.recordId);
@@ -173,7 +174,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
     const database = new DatabaseSync(paths.databasePath);
     assert.equal(
       Number(database.prepare('PRAGMA user_version').get().user_version),
-      2,
+      3,
     );
     assert.equal(
       Number(
@@ -205,7 +206,7 @@ test('migrates, stores raw evidence, and idempotently upserts a record', () => {
       databasePath: paths.databasePath,
       evidenceDirectory: paths.evidenceDirectory,
     });
-    assert.equal(reopened.schemaVersion, 2);
+    assert.equal(reopened.schemaVersion, 3);
     reopened.close();
   } finally {
     rmSync(paths.directory, { recursive: true, force: true });
@@ -304,5 +305,378 @@ test('evidence path resolution rejects directory traversal', () => {
     );
   } finally {
     rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('persists the complete authorized action lifecycle with its sync run', () => {
+  const paths = workspace();
+  try {
+    const store = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+      now: () => new Date('2026-08-29T01:00:00.000Z'),
+    });
+    const created = store.startAuthorizedSyncRun({
+      id: 'run_ledger_fixture',
+      actionId: 'action_ledger_fixture',
+      requestedMaxRecords: 10,
+      metadata: { source: 'demo' },
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 10 },
+      authorization: {
+        principal: 'local_operator',
+        decisionCode: 'manual_loopback_request',
+      },
+    });
+    assert.deepEqual(created, {
+      runId: 'run_ledger_fixture',
+      actionId: 'action_ledger_fixture',
+    });
+    assert.deepEqual(
+      store.listActionEvents(created.actionId).map((event) => event.phase),
+      ['proposal', 'validation', 'authorization'],
+    );
+
+    store.advanceAction(created.actionId, 'dispatch', {
+      requestedMaxRecords: 10,
+    });
+    const canonical = store.commitRecord(chatInput({ runId: created.runId }));
+    const settled = store.settleSyncRunAction({
+      runId: created.runId,
+      status: 'completed',
+      observation: { committed: 1, skippedKnown: 0 },
+      reconciliation: { workerCommitted: 1 },
+    });
+    assert.equal(settled.currentPhase, 'canonical_commit');
+    assert.equal(settled.terminal, true);
+    assert.equal(store.getSyncRun(created.runId)?.status, 'completed');
+    const events = store.listActionEvents(created.actionId);
+    assert.deepEqual(
+      events.map((event) => event.phase),
+      [
+        'proposal',
+        'validation',
+        'authorization',
+        'dispatch',
+        'observation',
+        'reconciliation',
+        'canonical_commit',
+      ],
+    );
+    assert.deepEqual(
+      events.map((event) => event.sequence),
+      [1, 2, 3, 4, 5, 6, 7],
+    );
+    assert.ok(events.every((event) => event.syncRunId === created.runId));
+    assert.ok(
+      events.every((event) => /^sha256:[a-f0-9]{64}$/.test(event.payloadHash)),
+    );
+    assert.ok(
+      events.every(
+        (event) => event.payloadHash === hashCanonicalJson(event.payload),
+      ),
+    );
+    const [recordCommit] = store.listSyncRecordCommits(created.runId);
+    assert.equal(recordCommit.actionId, created.actionId);
+    assert.equal(recordCommit.recordId, canonical.recordId);
+    assert.equal(recordCommit.sourceHash, canonical.sourceHash);
+    assert.equal(recordCommit.disposition, 'inserted');
+    assert.throws(
+      () => store.advanceAction(created.actionId, 'dispatch'),
+      (error) => error?.code === 'INVALID_ACTION_TRANSITION',
+    );
+    store.close();
+
+    const database = new DatabaseSync(paths.databasePath);
+    assert.throws(() =>
+      database
+        .prepare(
+          "UPDATE action_ledger_events SET phase = 'failed' WHERE event_id = ?",
+        )
+        .run(events[0].eventId),
+    );
+    assert.throws(() =>
+      database
+        .prepare('DELETE FROM action_ledger_events WHERE event_id = ?')
+        .run(events[0].eventId),
+    );
+    database.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('fails reconciliation atomically and preserves every terminal action on reopen', () => {
+  const paths = workspace();
+  try {
+    const store = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+      now: () => new Date('2026-08-29T01:30:00.000Z'),
+    });
+    const mismatch = store.startAuthorizedSyncRun({
+      id: 'run_mismatch',
+      actionId: 'action_mismatch',
+      requestedMaxRecords: 1,
+      connectorId: 'gray-swan',
+      connectorVersion: '1.0.0',
+      policyVersion: 'arena-read-only-sync-v1',
+      request: { source: 'demo', maxRecords: 1 },
+      authorization: {
+        principal: 'loopback_runtime_client',
+        decisionCode: 'bounded_readonly_policy_allow',
+      },
+    });
+    assert.throws(
+      () => store.advanceAction(mismatch.actionId, 'canonical_commit'),
+      (error) => error?.code === 'INVALID_INPUT',
+    );
+    assert.equal(store.getSyncRun(mismatch.runId)?.status, 'running');
+    store.advanceAction(mismatch.actionId, 'dispatch');
+    assert.throws(
+      () =>
+        store.settleSyncRunAction({
+          runId: mismatch.runId,
+          status: 'completed',
+          reconciliation: { workerCommitted: 1 },
+        }),
+      (error) => error?.code === 'RECONCILIATION_MISMATCH',
+    );
+    assert.equal(store.getSyncRun(mismatch.runId)?.status, 'running');
+    assert.equal(store.getAction(mismatch.actionId)?.currentPhase, 'dispatch');
+    assert.deepEqual(
+      store.listActionEvents(mismatch.actionId).map((event) => event.phase),
+      ['proposal', 'validation', 'authorization', 'dispatch'],
+    );
+    assert.throws(
+      () => store.finishSyncRun(mismatch.runId, 'failed'),
+      (error) => error?.code === 'ACTION_LEDGER_REQUIRED',
+    );
+    store.settleSyncRunAction({
+      runId: mismatch.runId,
+      status: 'failed',
+      stopReason: 'reconciliation_mismatch',
+      observation: { error: 'RECONCILIATION_MISMATCH' },
+    });
+
+    for (const terminalPhase of ['blocked', 'cancelled']) {
+      const created = store.startAuthorizedSyncRun({
+        id: `run_${terminalPhase}`,
+        actionId: `action_${terminalPhase}`,
+        requestedMaxRecords: 1,
+        connectorId: 'gray-swan',
+        connectorVersion: '1.0.0',
+        policyVersion: 'arena-read-only-sync-v1',
+        request: { source: 'demo', maxRecords: 1 },
+        authorization: {
+          principal: 'loopback_runtime_client',
+          decisionCode: 'bounded_readonly_policy_allow',
+        },
+      });
+      store.advanceAction(created.actionId, 'dispatch');
+      store.settleSyncRunAction({
+        runId: created.runId,
+        status: 'stopped',
+        stopReason: terminalPhase === 'cancelled' ? 'user_paused' : 'captcha',
+        terminalPhase,
+      });
+      assert.equal(
+        store.getAction(created.actionId)?.currentPhase,
+        terminalPhase,
+      );
+    }
+    store.close();
+
+    const reopened = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+    });
+    assert.equal(reopened.getAction('action_mismatch')?.currentPhase, 'failed');
+    assert.equal(reopened.getAction('action_blocked')?.currentPhase, 'blocked');
+    assert.equal(
+      reopened.getAction('action_cancelled')?.currentPhase,
+      'cancelled',
+    );
+    assert.equal(
+      reopened.listActionEvents('action_mismatch').at(-1)?.phase,
+      'failed',
+    );
+    reopened.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('uses generation-bound keyset cursors while preserving offset listing', () => {
+  const paths = workspace();
+  let clock = '2026-08-29T02:00:00.000Z';
+  try {
+    const store = new ArchiveStore({
+      databasePath: paths.databasePath,
+      evidenceDirectory: paths.evidenceDirectory,
+      now: () => new Date(clock),
+    });
+    for (const [index, externalId] of [
+      'chat_a',
+      'chat_b',
+      'chat_c',
+    ].entries()) {
+      clock = `2026-08-29T02:00:0${index}.000Z`;
+      store.commitRecord({
+        record: {
+          kind: 'chat',
+          platform: 'gray-swan',
+          externalId,
+          title: externalId,
+          normalized: { externalId },
+        },
+        evidence: [
+          {
+            artifactType: 'page_html',
+            content: `<html>${externalId}</html>`,
+          },
+        ],
+        checkpoint: {
+          scope: `scope_${externalId}`,
+          cursor: `cursor_${externalId}`,
+          expectedVersion: 0,
+        },
+      });
+    }
+
+    const first = store.queryRecords({ platform: 'gray-swan', limit: 2 });
+    assert.equal(first.items.length, 2);
+    assert.ok(first.nextCursor);
+    assert.equal(first.items[0].externalId, 'chat_c');
+    assert.equal(first.items[1].externalId, 'chat_b');
+    const second = store.queryRecords({
+      platform: 'gray-swan',
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    assert.deepEqual(
+      second.items.map((item) => item.externalId),
+      ['chat_a'],
+    );
+    assert.equal(second.nextCursor, null);
+    assert.equal(
+      store.listRecords({ limit: 1, offset: 1 })[0].externalId,
+      'chat_b',
+    );
+
+    assert.throws(
+      () =>
+        store.queryRecords({
+          kind: 'chat',
+          platform: 'gray-swan',
+          limit: 2,
+          cursor: first.nextCursor,
+        }),
+      (error) => error?.code === 'QUERY_CURSOR_MISMATCH',
+    );
+
+    clock = '2026-08-29T02:00:04.000Z';
+    store.commitRecord({
+      record: {
+        kind: 'submission',
+        platform: 'gray-swan',
+        externalId: 'submission_new',
+        normalized: {},
+      },
+      evidence: [{ artifactType: 'page_html', content: '<html>new</html>' }],
+      checkpoint: {
+        scope: 'scope_submission_new',
+        cursor: 'cursor_submission_new',
+        expectedVersion: 0,
+      },
+    });
+    assert.throws(
+      () =>
+        store.queryRecords({
+          platform: 'gray-swan',
+          limit: 2,
+          cursor: first.nextCursor,
+        }),
+      (error) => error?.code === 'STALE_QUERY_CURSOR',
+    );
+    store.close();
+  } finally {
+    rmSync(paths.directory, { recursive: true, force: true });
+  }
+});
+
+test('keyset cursors handle tied timestamps, malformed input, and catalog identity', () => {
+  const firstPaths = workspace();
+  const secondPaths = workspace();
+  const commitFixture = (store, externalId) =>
+    store.commitRecord({
+      record: {
+        kind: 'chat',
+        platform: 'gray-swan',
+        externalId,
+        normalized: { externalId },
+      },
+      evidence: [
+        { artifactType: 'page_html', content: `<html>${externalId}</html>` },
+      ],
+      checkpoint: {
+        scope: `scope_${externalId}`,
+        cursor: `cursor_${externalId}`,
+        expectedVersion: 0,
+      },
+    });
+  try {
+    const now = () => new Date('2026-08-29T03:00:00.000Z');
+    const firstStore = new ArchiveStore({
+      databasePath: firstPaths.databasePath,
+      evidenceDirectory: firstPaths.evidenceDirectory,
+      now,
+    });
+    for (const id of ['tie_a', 'tie_b', 'tie_c']) commitFixture(firstStore, id);
+    const expected = firstStore
+      .listRecords({ limit: 10 })
+      .map((item) => item.id);
+    const seen = [];
+    let cursor;
+    do {
+      const page = firstStore.queryRecords({ limit: 1, cursor });
+      seen.push(...page.items.map((item) => item.id));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    assert.deepEqual(seen, expected);
+    assert.equal(new Set(seen).size, 3);
+    assert.throws(
+      () => firstStore.queryRecords({ cursor: 'not+a+cursor' }),
+      (error) => error?.code === 'INVALID_CURSOR',
+    );
+
+    const stablePage = firstStore.queryRecords({ limit: 1 });
+    commitFixture(firstStore, 'tie_a');
+    assert.doesNotThrow(() =>
+      firstStore.queryRecords({ limit: 1, cursor: stablePage.nextCursor }),
+    );
+
+    const secondStore = new ArchiveStore({
+      databasePath: secondPaths.databasePath,
+      evidenceDirectory: secondPaths.evidenceDirectory,
+      now,
+    });
+    for (const id of ['tie_a', 'tie_b', 'tie_c'])
+      commitFixture(secondStore, id);
+    assert.throws(
+      () =>
+        secondStore.queryRecords({
+          limit: 1,
+          cursor: stablePage.nextCursor,
+        }),
+      (error) => error?.code === 'STALE_QUERY_CURSOR',
+    );
+    secondStore.close();
+    firstStore.close();
+  } finally {
+    rmSync(firstPaths.directory, { recursive: true, force: true });
+    rmSync(secondPaths.directory, { recursive: true, force: true });
   }
 });

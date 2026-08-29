@@ -4,12 +4,15 @@
 
 ## 已实现的边界
 
-- DSH 只看到四个语义工具：`arena_session_status`、`arena_sync_next_batch`、`arena_read_archived_record`、`arena_export`。
+- DSH 只看到五个语义工具：`arena_session_status`、`arena_sync_next_batch`、`arena_query_archive`、`arena_read_archived_record`、`arena_export`。
 - Browser Guardian 在语义工具、DOM 事件和网络请求三层 fail closed。
-- `AUTH_MODE` 只打开专用 Chrome Profile，登录、MFA、Passkey、CAPTCHA 全部由用户完成。
+- `AUTH_MODE` 只打开专用 Edge/Chrome 浏览器 Profile，登录、MFA、Passkey、CAPTCHA 全部由用户完成。
 - `COLLECT_MODE` 只有导航、读取与保存本地证据；GraphQL mutation、未知 POST、上传和跨 origin 文档均拒绝。
 - 原始证据先脱敏、计算 SHA-256，再与规范化记录和 checkpoint 原子提交到 SQLite。
-- 默认数据级别是 `local_only`；多模型路由在每次请求前检查数据策略、embargo、脱敏和 ZDR 条件。
+- 每个同步批次都有 SQLite 持久 action ledger，将 `proposal → validation → authorization → dispatch → observation → reconciliation → canonical_commit` 与 run/action ID 绑定；阻断、失败和取消也有明确终态。
+- 新查询 API 使用 `(updated_at DESC, id ASC)` keyset pagination。opaque cursor 绑定规范化 query hash、持久 catalog ID 与事务性 generation；canonical chat/submission catalog 变化后旧 cursor 返回 `STALE_QUERY_CURSOR`，原 offset API 继续兼容。
+- 默认数据级别是 `local_only`；模型路由只接受由当前 `ArchiveStore` attestation 生成且通过运行时品牌验证的 `AuthorizedModelProjection`，投影包含 source hash、固定 policy version 与 projection hash，不再信任调用方记录对象或 `redacted: true`。
+- 通用 `ArchiveConnectorRegistry` 只登记只读 connector 元数据；Gray Swan adapter 是首个 connector，现有 worker 仍是唯一执行路径。
 - 离线 fixture 覆盖完整状态机，因此不登录 Gray Swan 也能验证采集、幂等、恢复和策略拒绝。
 
 ## 本地启动
@@ -56,7 +59,7 @@ npm run arena -- auth
 
 Windows 上的 `AUTH_MODE` 会直接启动普通 Edge 或 Chrome，并在项目专用 profile 中打开三个登录标签页。它不受 Playwright 控制，因此兼容 Google OAuth；登录完成后关闭整个登录浏览器，`COLLECT_MODE` 才会以单页、单并发和只读策略复用该 profile。
 
-这会打开一个独立 Chrome Profile。Arena Archivist 不读取或记录密码、Cookie、localStorage、authorization header，也不应指向你日常使用的 Chrome Profile。登录失效或出现 CAPTCHA 时，采集器暂停等待人工接管。
+这会打开一个独立的 Edge/Chrome 项目 Profile。Arena Archivist 不读取或记录密码、Cookie、localStorage、authorization header，也不应指向你日常使用的浏览器 Profile。登录失效或出现 CAPTCHA 时，采集器暂停等待人工接管。
 
 ## 启用真实采集前
 
@@ -82,7 +85,13 @@ Cordis: 4.0.1
 
 版本锁在 `dsh/VERSION.lock`，专用插件位于 `packages/dsh-profile-arena/`。`dsh/arena-profile.patch.yml` 是最小 profile 片段；不要把它叠加在加载了 shell、filesystem、web、editor、workflow、subagent、scheduler 或通用 Playwright MCP 的默认 profile 上。应从空 profile 组合，并用 DSH 的 `--dump-config` 审核最终插件树。
 
-DSH 是 Agent/session/model orchestration 层，不是安全沙箱或档案真源。`arena.sqlite` 与 crawler checkpoint 才是 canonical state。
+DSH 是 Agent/session/model orchestration 层，不是安全沙箱或档案真源。`arena.sqlite`（包括其中的 `checkpoints` 表）才是 canonical state。
+
+DSH 的查询工具只返回无正文记录句柄、query hash、catalog generation 和 opaque cursor；读取工具只返回 `contentReleased: false` 的投影收据（本地句柄与 source/policy/projection/authorization hashes）。完整投影只在本地进程内交给 `ModelRouter` 验证，原始正文、标题、outcome、evidence path、checkpoint cursor、导出路径、浏览器状态、Cookie 与 Playwright primitive 都不进入模型工具结果。
+
+## 项目合并状态
+
+`D:\Agent` 是唯一主项目。原 `D:\devspace\projects\web-archive-agent` 中有价值的 ledger、cursor binding、projection 和 connector registry 思路已按本项目 TypeScript/SQLite 边界重新实现，没有复制其整套 JavaScript runtime，也没有建立第二套产品或第二个真源。供体目录现在仅是只读历史参考，可由项目所有者归档；本仓库不会读取、运行或修改它。
 
 ## 项目结构
 
@@ -91,12 +100,13 @@ app/                         Dashboard
 apps/runtime/                localhost API 与 CLI
 packages/dsh-profile-arena/  DSH 语义工具与单调 guard
 packages/browser-worker/     Playwright 只读状态机
+packages/archive-connectors/ 通用只读 connector registry/interface
 packages/gray-swan-adapter/  页面 contract、parser、fixture
 packages/browser-policy/     语义/DOM/网络策略
 packages/rate-governor/      批次预算与退避
-packages/archive-store/      SQLite、证据哈希、checkpoint
+packages/archive-store/      SQLite、action ledger、keyset query、证据与 checkpoint
 packages/auth-broker/        不透明凭据接口
-packages/model-router/       数据分级路由
+packages/model-router/       确定性投影与数据分级路由
 packages/analysis-engine/    确定性指标与报告
 packages/exporter/           secret scan 与 analysis pack
 policies/                    人类可审阅的策略配置
@@ -104,4 +114,4 @@ schemas/                     档案与标注 JSON Schema
 docs/                        架构、威胁模型、数据字典
 ```
 
-安全设计与不变量详见 [docs/threat-model.md](docs/threat-model.md)，数据流详见 [docs/architecture.md](docs/architecture.md)。
+安全设计与不变量详见 [docs/threat-model.md](docs/threat-model.md)，数据流详见 [docs/architecture.md](docs/architecture.md)，SQLite 字段与 cursor/projection 形状详见 [docs/data-dictionary.md](docs/data-dictionary.md)。

@@ -31,6 +31,13 @@ const listInput = z.object({
   offset: z.coerce.number().int().min(0).default(0),
 });
 
+const recordQueryInput = z.object({
+  kind: z.enum(['chat', 'submission']).optional(),
+  platform: z.string().trim().min(1).max(256).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  cursor: z.string().trim().min(1).max(4096).optional(),
+});
+
 const policyListInput = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(100),
   offset: z.coerce.number().int().min(0).default(0),
@@ -58,7 +65,9 @@ export interface RuntimeController {
   startSync(input: z.infer<typeof syncInput>): Promise<unknown>;
   pause(): Promise<unknown>;
   listRecords(input: z.infer<typeof listInput>): unknown;
-  readRecord(recordId: string): unknown;
+  queryRecords(input: z.infer<typeof recordQueryInput>): unknown;
+  readRecordProjection(recordId: string): unknown;
+  readAction(actionId: string): unknown;
   listPolicyEvents(input: z.infer<typeof policyListInput>): unknown;
   nvidiaProviderStatus(): Promise<unknown>;
   configureNvidia(input: z.infer<typeof nvidiaConfigInput>): Promise<unknown>;
@@ -171,17 +180,19 @@ function safeError(error: unknown): {
   const status =
     code === 'NOT_FOUND'
       ? 404
-      : code === 'CONFLICT'
+      : code === 'CONFLICT' || code === 'STALE_QUERY_CURSOR'
         ? 409
-        : code === 'CREDENTIAL_REQUIRED'
+        : code === 'INVALID_CURSOR' || code === 'QUERY_CURSOR_MISMATCH'
           ? 400
-          : code === 'NVIDIA_MODEL_NOT_IN_CATALOG'
+          : code === 'CREDENTIAL_REQUIRED'
             ? 400
-            : code === 'NVIDIA_CATALOG_REQUIRED'
-              ? 409
-              : code === 'NVIDIA_CATALOG_FAILED'
-                ? 502
-                : 500;
+            : code === 'NVIDIA_MODEL_NOT_IN_CATALOG'
+              ? 400
+              : code === 'NVIDIA_CATALOG_REQUIRED'
+                ? 409
+                : code === 'NVIDIA_CATALOG_FAILED'
+                  ? 502
+                  : 500;
   return {
     status,
     body: redactSecrets({ code, message }) as Record<string, unknown>,
@@ -283,13 +294,32 @@ export function createRuntimeHttpServer(
         );
       } else if (
         request.method === 'GET' &&
-        url.pathname.startsWith('/v1/records/')
+        url.pathname === '/v1/records/query'
       ) {
-        const recordId = decodeURIComponent(
-          url.pathname.slice('/v1/records/'.length),
+        body = await controller.queryRecords(
+          recordQueryInput.parse(
+            Object.fromEntries(url.searchParams.entries()),
+          ),
         );
+      } else if (
+        request.method === 'GET' &&
+        /^\/v1\/records\/[^/]+\/projection$/.test(url.pathname)
+      ) {
+        const encodedId = url.pathname
+          .slice('/v1/records/'.length)
+          .slice(0, -'/projection'.length);
+        const recordId = decodeURIComponent(encodedId);
         if (!recordId) throw new HttpError(400, 'record_id_required');
-        body = await controller.readRecord(recordId);
+        body = await controller.readRecordProjection(recordId);
+      } else if (
+        request.method === 'GET' &&
+        url.pathname.startsWith('/v1/actions/')
+      ) {
+        const actionId = decodeURIComponent(
+          url.pathname.slice('/v1/actions/'.length),
+        );
+        if (!actionId) throw new HttpError(400, 'action_id_required');
+        body = await controller.readAction(actionId);
       } else if (
         request.method === 'GET' &&
         url.pathname === '/v1/policy/events'

@@ -9,6 +9,8 @@ export default defineConfig({
     include: [
       'apps/runtime/tests/**/*.test.ts',
       'packages/auth-broker/tests/**/*.test.ts',
+      'packages/archive-connectors/tests/**/*.test.ts',
+      'packages/dsh-profile-arena/tests/**/*.test.ts',
       'packages/model-router/tests/**/*.test.ts',
       'packages/analysis-engine/tests/**/*.test.ts',
       'packages/exporter/tests/**/*.test.ts',

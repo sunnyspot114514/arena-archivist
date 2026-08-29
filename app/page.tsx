@@ -27,7 +27,11 @@ import {
 } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { NvidiaProviderDialog } from '@/components/nvidia-provider-dialog';
-import { arenaRuntime, type ArenaRuntimeStatus } from '@/lib/arena-runtime';
+import {
+  arenaRuntime,
+  type ArchiveQueryPage,
+  type ArenaRuntimeStatus,
+} from '@/lib/arena-runtime';
 
 const navigation = [
   { label: '运行总览', icon: Radar, active: true },
@@ -45,14 +49,19 @@ const invariants = [
 
 export default function Home() {
   const [status, setStatus] = useState<ArenaRuntimeStatus | null>(null);
+  const [archivePage, setArchivePage] = useState<ArchiveQueryPage | null>(null);
   const [reachable, setReachable] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const next = await arenaRuntime.status();
+      const [next, recent] = await Promise.all([
+        arenaRuntime.status(),
+        arenaRuntime.queryRecords({ limit: 6 }),
+      ]);
       setStatus(next);
+      setArchivePage(recent);
       setReachable(true);
     } catch {
       setReachable(false);
@@ -353,6 +362,18 @@ export default function Home() {
                       <span>第三次失败停止</span>
                     </div>
                   </div>
+                  {status?.run?.actionId ? (
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/25 px-4 py-3 text-xs">
+                      <span className="text-muted-foreground">
+                        Durable action
+                      </span>
+                      <span className="font-mono">
+                        {status.run.actionId.slice(0, 20)} ·{' '}
+                        {status.run.actionPhase ?? 'unknown'} ·{' '}
+                        {status.run.connectorId ?? 'unregistered'}
+                      </span>
+                    </div>
+                  ) : null}
                 </CardContent>
               </Card>
 
@@ -428,6 +449,62 @@ export default function Home() {
                 </Card>
               ))}
             </div>
+
+            <Card className="mt-4 border-0 ring-border">
+              <CardHeader className="border-b border-border">
+                <CardTitle className="flex items-center gap-2 text-sm">
+                  <Archive className="size-4" aria-hidden="true" />
+                  最近归档
+                </CardTitle>
+                <CardDescription>
+                  通过稳定 keyset
+                  查询读取本地记录句柄；模型读取时另行生成确定性脱敏投影。
+                </CardDescription>
+                <CardAction>
+                  <Badge variant="outline" className="font-mono text-[10px]">
+                    CATALOG G{archivePage?.catalogGeneration ?? '—'}
+                  </Badge>
+                </CardAction>
+              </CardHeader>
+              <CardContent className="p-0">
+                {archivePage?.items.length ? (
+                  <div className="divide-y divide-border">
+                    {archivePage.items.map((record) => (
+                      <div
+                        key={record.id}
+                        className="grid gap-2 px-5 py-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">
+                            {record.title ?? record.outcome ?? record.id}
+                          </p>
+                          <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">
+                            {record.kind} · {record.id} ·{' '}
+                            {record.sourceHash?.slice(0, 24) ??
+                              'no-source-hash'}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                          <Badge
+                            variant="secondary"
+                            className="font-mono text-[10px]"
+                          >
+                            {record.dataPolicy}
+                          </Badge>
+                          <span>
+                            {new Date(record.updatedAt).toLocaleString('zh-CN')}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="px-5 py-8 text-center text-sm text-muted-foreground">
+                    尚无归档记录；可运行离线 fixture 验证完整链路。
+                  </p>
+                )}
+              </CardContent>
+            </Card>
 
             <div className="mt-4 flex flex-col gap-4 rounded-xl border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
               <div>

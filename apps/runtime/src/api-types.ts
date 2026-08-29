@@ -32,6 +32,20 @@ export type RuntimeStatus = {
   };
   run: {
     id: string;
+    actionId: string | null;
+    actionPhase:
+      | 'proposal'
+      | 'validation'
+      | 'authorization'
+      | 'dispatch'
+      | 'observation'
+      | 'reconciliation'
+      | 'canonical_commit'
+      | 'blocked'
+      | 'failed'
+      | 'cancelled'
+      | null;
+    connectorId: string | null;
     state: 'running' | 'completed' | 'stopped' | 'failed';
     source: 'demo' | 'live';
     requested: number;
@@ -52,6 +66,15 @@ export type RuntimeStatus = {
     id: string;
     status: 'connected' | 'disconnected';
     activeModel?: string | null;
+  }>;
+  connectors: Array<{
+    id: string;
+    displayName: string;
+    version: string;
+    readOnly: true;
+    recordKinds: readonly string[];
+    capabilities: readonly string[];
+    cursorFormat: string;
   }>;
 };
 

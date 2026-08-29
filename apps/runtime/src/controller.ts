@@ -4,8 +4,10 @@ import { resolve } from 'node:path';
 
 import {
   ArchiveStore,
+  type StoredActionLedgerAction,
   type StoredSyncRun,
 } from '../../../packages/archive-store/index';
+import { ArchiveConnectorRegistry } from '../../../packages/archive-connectors/src/index';
 import {
   OfflineFixtureBrowser,
   GraySwanBrowserWorker,
@@ -26,9 +28,11 @@ import {
 } from '../../../packages/analysis-engine/src/index';
 import { exportAnalysisPack } from '../../../packages/exporter/src/index';
 import {
-  detectBlockingCondition,
-  loadSelectorContract,
-  parseIndexSnapshot,
+  createAuthorizedModelProjection,
+  createAuthorizedModelProjectionReceipt,
+} from '../../../packages/model-router/src/index';
+import {
+  graySwanArchiveConnector,
   type GraySwanSelectorContract,
 } from '../../../packages/gray-swan-adapter/src/index';
 import {
@@ -58,6 +62,7 @@ import {
 } from './provider-manager';
 
 const VERSION = '0.1.0';
+const SYNC_POLICY_VERSION = 'arena-read-only-sync-v1';
 
 class RuntimeError extends Error {
   constructor(
@@ -71,6 +76,9 @@ class RuntimeError extends Error {
 
 type ActiveRun = {
   id: string;
+  actionId: string;
+  connectorId: string;
+  connectorVersion: string;
   source: 'demo' | 'live';
   requested: number;
   controller: AbortController;
@@ -81,10 +89,16 @@ function runSource(run: StoredSyncRun): 'demo' | 'live' {
   return run.metadata.source === 'live' ? 'live' : 'demo';
 }
 
-function statusRun(run: StoredSyncRun | null): RuntimeStatus['run'] {
+function statusRun(
+  run: StoredSyncRun | null,
+  action: StoredActionLedgerAction | null = null,
+): RuntimeStatus['run'] {
   if (!run) return null;
   return {
     id: run.id,
+    actionId: action?.actionId ?? null,
+    actionPhase: action?.currentPhase ?? null,
+    connectorId: action?.connectorId ?? null,
     state: run.status,
     source: runSource(run),
     requested: run.requestedMaxRecords ?? 0,
@@ -169,6 +183,8 @@ export class ArenaRuntimeController implements RuntimeController {
   readonly #governor: RateGovernor;
   readonly #auth: EnvironmentAuthBroker;
   readonly #providerSettings: ProviderSettingsStore;
+  readonly #connectors: ArchiveConnectorRegistry;
+  readonly #graySwanConnector: typeof graySwanArchiveConnector;
   readonly #nvidiaBaseUrl: 'https://integrate.api.nvidia.com/v1';
   readonly #config: RuntimeConfig;
   readonly #fixtureContract: GraySwanSelectorContract;
@@ -187,6 +203,8 @@ export class ArenaRuntimeController implements RuntimeController {
     governor: RateGovernor;
     auth: EnvironmentAuthBroker;
     providerSettings: ProviderSettingsStore;
+    connectors: ArchiveConnectorRegistry;
+    graySwanConnector: typeof graySwanArchiveConnector;
     nvidiaBaseUrl: 'https://integrate.api.nvidia.com/v1';
     fixtureContract: GraySwanSelectorContract;
     liveContract: GraySwanSelectorContract | null;
@@ -196,6 +214,8 @@ export class ArenaRuntimeController implements RuntimeController {
     this.#governor = options.governor;
     this.#auth = options.auth;
     this.#providerSettings = options.providerSettings;
+    this.#connectors = options.connectors;
+    this.#graySwanConnector = options.graySwanConnector;
     this.#nvidiaBaseUrl = options.nvidiaBaseUrl;
     this.#fixtureContract = options.fixtureContract;
     this.#liveContract = options.liveContract;
@@ -207,8 +227,28 @@ export class ArenaRuntimeController implements RuntimeController {
       evidenceDirectory: config.evidenceDirectory,
     });
     for (const run of store.listSyncRuns({ status: 'running', limit: 500 })) {
-      store.finishSyncRun(run.id, 'failed', 'process_restarted');
+      const action = store.getActionForRun(run.id);
+      if (action?.terminal) {
+        store.close();
+        throw new RuntimeError(
+          'CORRUPT_ACTION_LEDGER',
+          `Running sync ${run.id} has a terminal action`,
+        );
+      }
+      if (action) {
+        store.settleSyncRunAction({
+          runId: run.id,
+          status: 'failed',
+          stopReason: 'process_restarted',
+          observation: { recovery: true },
+        });
+      } else {
+        store.finishSyncRun(run.id, 'failed', 'process_restarted');
+      }
     }
+
+    const connectors = new ArchiveConnectorRegistry();
+    const graySwanConnector = connectors.register(graySwanArchiveConnector);
 
     const governor = new RateGovernor({
       store: new JsonFileGovernorStateStore(
@@ -220,7 +260,7 @@ export class ArenaRuntimeController implements RuntimeController {
       governor.cancelRun(governorState.activeRun.runId);
     }
 
-    const fixtureContract = await loadSelectorContract(
+    const fixtureContract = await graySwanConnector.loadContract(
       resolve(
         config.workspaceRoot,
         'packages',
@@ -230,7 +270,7 @@ export class ArenaRuntimeController implements RuntimeController {
       ),
     );
     const liveContract = config.liveSelectorContractPath
-      ? await loadSelectorContract(config.liveSelectorContractPath)
+      ? await graySwanConnector.loadContract(config.liveSelectorContractPath)
       : null;
     if (
       config.liveCollectionEnabled &&
@@ -263,6 +303,8 @@ export class ArenaRuntimeController implements RuntimeController {
       governor,
       auth,
       providerSettings,
+      connectors,
+      graySwanConnector,
       nvidiaBaseUrl,
       fixtureContract,
       liveContract,
@@ -351,6 +393,9 @@ export class ArenaRuntimeController implements RuntimeController {
     );
     const lastCheckpoint = checkpoints[0] ?? null;
     const latestRun = this.#store.listSyncRuns({ limit: 1 })[0] ?? null;
+    const latestAction = latestRun
+      ? this.#store.getActionForRun(latestRun.id)
+      : null;
     const governor = this.#governor.snapshot();
     const providerStatuses: AuthStatus[] = await Promise.all(
       ['deepseek', 'minimax', 'nvidia', 'openrouter'].map((id) =>
@@ -392,7 +437,7 @@ export class ArenaRuntimeController implements RuntimeController {
             }
           : null,
       },
-      run: statusRun(latestRun),
+      run: statusRun(latestRun, latestAction),
       budget: {
         runsToday: governor.runsStartedToday,
         maxRunsPerDay: 3,
@@ -408,6 +453,7 @@ export class ArenaRuntimeController implements RuntimeController {
             ? this.#providerSettings.nvidiaModel
             : undefined,
       })),
+      connectors: this.#connectors.list(),
     };
   }
 
@@ -468,8 +514,10 @@ export class ArenaRuntimeController implements RuntimeController {
       await browser.navigate(this.#config.liveIndexUrl!);
       const violation = browser.consumePolicyViolation();
       const snapshot = await browser.snapshot();
-      const blocker = detectBlockingCondition(snapshot, contract);
-      const parsed = blocker ? null : parseIndexSnapshot(snapshot, contract);
+      const blocker = this.#graySwanConnector.detectBlocker(snapshot, contract);
+      const parsed = blocker
+        ? null
+        : this.#graySwanConnector.parseIndex(snapshot, contract);
       this.#session =
         !violation && !blocker && parsed?.ok ? 'valid' : 'invalid';
       this.#lastValidatedAt = new Date().toISOString();
@@ -499,11 +547,24 @@ export class ArenaRuntimeController implements RuntimeController {
       runId = `demo_${randomUUID()}`;
     }
     try {
-      this.#store.startSyncRun({
+      const created = this.#store.startAuthorizedSyncRun({
         id: runId,
         requestedMaxRecords: input.maxRecords,
         metadata: { source: input.source },
+        connectorId: this.#graySwanConnector.metadata.id,
+        connectorVersion: this.#graySwanConnector.metadata.version,
+        policyVersion: SYNC_POLICY_VERSION,
+        request: {
+          source: input.source,
+          maxRecords: input.maxRecords,
+          operation: 'sync_next_batch',
+        },
+        authorization: {
+          principal: 'loopback_runtime_client',
+          decisionCode: 'bounded_readonly_policy_allow',
+        },
       });
+      runId = created.runId;
     } catch (error) {
       if (input.source === 'live') this.#safeCancelGovernor(runId);
       throw error;
@@ -512,6 +573,9 @@ export class ArenaRuntimeController implements RuntimeController {
     const controller = new AbortController();
     const active: ActiveRun = {
       id: runId,
+      actionId: this.#store.getActionForRun(runId)!.actionId,
+      connectorId: this.#graySwanConnector.metadata.id,
+      connectorVersion: this.#graySwanConnector.metadata.version,
       source: input.source,
       requested: input.maxRecords,
       controller,
@@ -521,7 +585,12 @@ export class ArenaRuntimeController implements RuntimeController {
     active.promise = this.#executeRun(active).finally(() => {
       if (this.#activeRun === active) this.#activeRun = null;
     });
-    return { run: statusRun(this.#store.getSyncRun(runId)) };
+    return {
+      run: statusRun(
+        this.#store.getSyncRun(runId),
+        this.#store.getActionForRun(runId),
+      ),
+    };
   }
 
   async pause(): Promise<{ status: 'pausing' | 'idle' }> {
@@ -559,12 +628,58 @@ export class ArenaRuntimeController implements RuntimeController {
     return { items, total };
   }
 
-  readRecord(recordId: string): unknown {
+  queryRecords(input: {
+    kind?: 'chat' | 'submission';
+    platform?: string;
+    limit: number;
+    cursor?: string;
+  }): {
+    items: unknown[];
+    nextCursor: string | null;
+    queryHash: string;
+    catalogGeneration: number;
+  } {
     this.#assertOpen();
-    const record = this.#store.getRecordById(recordId);
-    if (!record)
+    const page = this.#store.queryRecords(input);
+    return {
+      ...page,
+      items: page.items.map((summary) => {
+        const record = this.#store.getRecordById(summary.id);
+        return {
+          id: summary.id,
+          kind: summary.kind,
+          platform: summary.platform,
+          title: record?.title ?? stringValue(record?.normalized.title),
+          outcome: record?.outcome ?? null,
+          dataPolicy: summary.dataPolicy,
+          sourceHash: summary.sourceHash,
+          updatedAt: summary.updatedAt,
+        };
+      }),
+    };
+  }
+
+  readRecordProjection(recordId: string): unknown {
+    this.#assertOpen();
+    const attestation = this.#store.attestRecord(recordId);
+    if (!attestation)
       throw new RuntimeError('NOT_FOUND', 'Archive record not found');
-    return { record };
+    const projection = createAuthorizedModelProjection(attestation);
+    return {
+      projectionReceipt: createAuthorizedModelProjectionReceipt(projection),
+    };
+  }
+
+  readAction(actionId: string): unknown {
+    this.#assertOpen();
+    const action = this.#store.getAction(actionId);
+    if (!action)
+      throw new RuntimeError('NOT_FOUND', 'Action ledger entry not found');
+    return {
+      action,
+      events: this.#store.listActionEvents(actionId),
+      recordCommits: this.#store.listSyncRecordCommits(action.syncRunId),
+    };
   }
 
   listPolicyEvents(input: { limit: number; offset: number }): {
@@ -648,6 +763,12 @@ export class ArenaRuntimeController implements RuntimeController {
   async #executeRun(run: ActiveRun): Promise<void> {
     let browser: CollectBrowserPort | null = null;
     try {
+      this.#store.advanceAction(run.actionId, 'dispatch', {
+        source: run.source,
+        connectorId: run.connectorId,
+        connectorVersion: run.connectorVersion,
+        requestedMaxRecords: run.requested,
+      });
       const setup =
         run.source === 'demo'
           ? await this.#openDemoBrowser()
@@ -673,7 +794,7 @@ export class ArenaRuntimeController implements RuntimeController {
           archive: new ArchiveStorePort(this.#store, run.id, setup.platform),
           selectorContract: setup.contract,
           runBudget: { tryStart: async () => true },
-          audit: new ArchiveAuditPort(this.#store),
+          audit: new ArchiveAuditPort(this.#store, run.id, run.actionId),
         },
       );
       const result = await worker.runNextBatch({
@@ -684,7 +805,19 @@ export class ArenaRuntimeController implements RuntimeController {
     } catch (error) {
       const current = this.#store.getSyncRun(run.id);
       if (current?.status === 'running') {
-        this.#store.finishSyncRun(run.id, 'failed', 'runtime_error');
+        try {
+          this.#store.settleSyncRunAction({
+            runId: run.id,
+            status: 'failed',
+            stopReason: 'runtime_error',
+            observation: {
+              error: error instanceof Error ? error.name : 'runtime_error',
+            },
+          });
+        } catch {
+          // Preserve the running action/run pair for explicit startup recovery.
+          // Updating only one side would destroy the durable lifecycle invariant.
+        }
       }
       if (run.source === 'live') this.#safeCancelGovernor(run.id);
       this.#store.appendPolicyDecision({
@@ -702,11 +835,24 @@ export class ArenaRuntimeController implements RuntimeController {
   }
 
   #settleRun(run: ActiveRun, result: WorkerRunResult): void {
-    this.#store.finishSyncRun(
-      run.id,
-      result.status === 'completed' ? 'completed' : 'stopped',
-      result.stopReason ?? undefined,
-    );
+    this.#store.settleSyncRunAction({
+      runId: run.id,
+      status: result.status === 'completed' ? 'completed' : 'stopped',
+      stopReason: result.stopReason ?? undefined,
+      terminalPhase:
+        result.stopReason === 'user_paused' ? 'cancelled' : 'blocked',
+      observation: {
+        workerStatus: result.status,
+        stopReason: result.stopReason,
+        committed: result.committed,
+        skippedKnown: result.skippedKnown,
+        visitedStates: [...result.visitedStates],
+      },
+      reconciliation: {
+        workerCommitted: result.committed,
+        skippedKnown: result.skippedKnown,
+      },
+    });
     if (run.source !== 'live') return;
     const immediate = immediateStop(result.stopReason);
     try {
@@ -845,6 +991,12 @@ export class ArenaRuntimeController implements RuntimeController {
     this.#assertOpen();
     if (this.#activeRun)
       throw new RuntimeError('CONFLICT', 'A sync run is already active');
+    if (this.#store.stats().activeSyncRuns > 0) {
+      throw new RuntimeError(
+        'CONFLICT',
+        'A durable sync run still requires recovery; restart the runtime',
+      );
+    }
   }
 
   #safeCancelGovernor(runId: string): void {

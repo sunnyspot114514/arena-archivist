@@ -188,7 +188,11 @@ export class ArchiveStorePort implements ArchivePort {
 }
 
 export class ArchiveAuditPort implements AuditPort {
-  constructor(readonly store: ArchiveStore) {}
+  constructor(
+    readonly store: ArchiveStore,
+    readonly runId: string,
+    readonly actionId: string,
+  ) {}
 
   write(event: WorkerAuditEvent): void {
     this.store.appendPolicyDecision({
@@ -199,7 +203,11 @@ export class ArchiveAuditPort implements AuditPort {
       allowed: event.type !== 'policy_denial' && event.type !== 'run_stopped',
       reason: event.reason ?? event.type,
       action: event.state ?? event.type,
-      metadata: event.externalId ? { externalId: event.externalId } : {},
+      metadata: {
+        runId: this.runId,
+        actionId: this.actionId,
+        ...(event.externalId ? { externalId: event.externalId } : {}),
+      },
     });
   }
 }

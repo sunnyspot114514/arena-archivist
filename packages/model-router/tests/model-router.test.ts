@@ -1,10 +1,24 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import type {
+  AttestedArchiveRecord,
+  DataPolicy,
+} from '../../archive-store/index';
+import { ArchiveStore } from '../../archive-store/index';
+import {
+  OpaqueCredentialHandle,
+  type AuthBroker,
+  type CredentialExecutor,
+} from '../../auth-broker/src/index';
 import {
   authorizeRoute,
-  type CompletionRequest,
+  createAuthorizedModelProjection,
+  ModelRouter,
+  type AuthorizedModelProjection,
   type ProviderRoute,
-  type RecordPolicy,
 } from '../src/index';
 
 const directRoute: ProviderRoute = {
@@ -30,106 +44,201 @@ const routerRoute: ProviderRoute = {
   promptLogging: false,
 };
 
-function policy(
-  level: RecordPolicy['level'],
-  overrides: Partial<RecordPolicy> = {},
-): RecordPolicy {
-  return {
-    level,
-    externalProcessingAllowed: true,
-    embargoUntil: null,
-    redactionVersion: 'v1',
-    ...overrides,
-  };
+function attestation(
+  level: DataPolicy,
+  overrides: {
+    externalProcessingAllowed?: boolean;
+    embargoUntil?: string | null;
+  } = {},
+): AttestedArchiveRecord {
+  const directory = mkdtempSync(join(tmpdir(), 'arena-model-router-'));
+  try {
+    const store = new ArchiveStore({
+      databasePath: ':memory:',
+      evidenceDirectory: join(directory, 'evidence'),
+      now: () => new Date('2026-08-29T00:00:00.000Z'),
+    });
+    const committed = store.commitRecord({
+      record: {
+        kind: 'chat',
+        platform: 'gray-swan-fixture',
+        externalId: 'external_fixture',
+        title: 'Fixture',
+        status: 'complete',
+        normalized: {},
+        dataPolicy: level,
+        externalProcessingAllowed:
+          overrides.externalProcessingAllowed ?? level !== 'local_only',
+        embargoUntil: overrides.embargoUntil ?? null,
+      },
+      evidence: [
+        { artifactType: 'page_html', content: '<html>fixture</html>' },
+      ],
+      checkpoint: { scope: 'fixture', cursor: 'fixture', expectedVersion: 0 },
+    });
+    const value = store.attestRecord(committed.recordId);
+    store.close();
+    if (!value) throw new Error('fixture attestation missing');
+    return value;
+  } finally {
+    rmSync(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 20,
+    });
+  }
 }
 
-function request(
-  recordPolicy: RecordPolicy,
-  overrides: Partial<Pick<CompletionRequest, 'task' | 'redacted'>> = {},
-) {
-  return {
-    task: 'offline_review' as const,
-    redacted: false,
-    recordPolicy,
-    ...overrides,
-  };
+function request(projection: AuthorizedModelProjection) {
+  return { task: 'offline_review' as const, projection };
 }
 
 describe('data classification routing', () => {
   it('keeps local-only records off every external route', () => {
-    expect(authorizeRoute(directRoute, request(policy('local_only')))).toEqual({
+    const projection = createAuthorizedModelProjection(
+      attestation('local_only'),
+    );
+    expect(authorizeRoute(directRoute, request(projection))).toEqual({
       allowed: false,
       reason: 'record_is_local_only',
     });
-    expect(
-      authorizeRoute(
-        routerRoute,
-        request(policy('local_only'), { redacted: true }),
-      ),
-    ).toEqual({
+    expect(authorizeRoute(routerRoute, request(projection))).toEqual({
       allowed: false,
       reason: 'record_is_local_only',
     });
   });
 
   it('allows direct-provider-only records only through a direct provider', () => {
-    expect(
-      authorizeRoute(directRoute, request(policy('direct_provider_only')))
-        .allowed,
-    ).toBe(true);
-    expect(
-      authorizeRoute(
-        routerRoute,
-        request(policy('direct_provider_only'), { redacted: true }),
-      ),
-    ).toEqual({ allowed: false, reason: 'router_disallowed_by_record_policy' });
-  });
-
-  it('requires ZDR, disabled logging, and a redacted copy for router processing', () => {
-    const routed = request(policy('zdr_router_allowed'), { redacted: true });
-    expect(authorizeRoute(routerRoute, routed).allowed).toBe(true);
-    expect(authorizeRoute(routerRoute, { ...routed, redacted: false })).toEqual(
-      {
-        allowed: false,
-        reason: 'router_requires_redacted_copy',
-      },
+    const projection = createAuthorizedModelProjection(
+      attestation('direct_provider_only'),
     );
+    expect(authorizeRoute(directRoute, request(projection)).allowed).toBe(true);
+    expect(authorizeRoute(routerRoute, request(projection))).toEqual({
+      allowed: false,
+      reason: 'router_disallowed_by_record_policy',
+    });
+  });
+
+  it('requires ZDR, disabled logging, and a locally generated projection for routers', () => {
+    const projection = createAuthorizedModelProjection(
+      attestation('zdr_router_allowed'),
+    );
+    expect(authorizeRoute(routerRoute, request(projection)).allowed).toBe(true);
+    const forged = structuredClone(projection) as AuthorizedModelProjection;
+    expect(authorizeRoute(routerRoute, request(forged))).toEqual({
+      allowed: false,
+      reason: 'projection_not_locally_authorized',
+    });
     expect(
-      authorizeRoute({ ...routerRoute, zeroDataRetention: false }, routed),
+      authorizeRoute(
+        { ...routerRoute, zeroDataRetention: false },
+        request(projection),
+      ),
     ).toEqual({
       allowed: false,
       reason: 'router_privacy_requirements_not_met',
     });
     expect(
-      authorizeRoute({ ...routerRoute, promptLogging: true }, routed),
+      authorizeRoute(
+        { ...routerRoute, promptLogging: true },
+        request(projection),
+      ),
     ).toEqual({
       allowed: false,
       reason: 'router_privacy_requirements_not_met',
     });
   });
 
-  it('fails closed for disabled external processing and active or invalid embargoes', () => {
+  it('fails closed for disabled external processing and active embargoes', () => {
     const now = new Date('2026-08-29T00:00:00.000Z');
+    const disabled = createAuthorizedModelProjection(
+      attestation('public', { externalProcessingAllowed: false }),
+    );
+    expect(authorizeRoute(directRoute, request(disabled), now)).toEqual({
+      allowed: false,
+      reason: 'external_processing_not_allowed',
+    });
+    const embargoed = createAuthorizedModelProjection(
+      attestation('public', {
+        embargoUntil: '2026-08-30T00:00:00.000Z',
+      }),
+    );
+    expect(authorizeRoute(directRoute, request(embargoed), now)).toEqual({
+      allowed: false,
+      reason: 'record_embargo_active',
+    });
+  });
+
+  it('rejects route configuration that could override projection messages', () => {
     expect(
-      authorizeRoute(
-        directRoute,
-        request(policy('public', { externalProcessingAllowed: false })),
-        now,
+      () =>
+        new ModelRouter({
+          routes: [
+            {
+              ...directRoute,
+              additionalBody: {
+                messages: [{ role: 'user', content: 'raw caller content' }],
+              },
+            },
+          ],
+          auth: {} as never,
+        }),
+    ).toThrow(/protected body field: messages/);
+  });
+
+  it('builds the provider body only from the verified projection', async () => {
+    let providerBody: Record<string, unknown> | null = null;
+    const auth: AuthBroker & CredentialExecutor = {
+      status: async () => ({
+        provider: 'fixture-direct',
+        connectionId: 'direct',
+        status: 'connected',
+      }),
+      begin: async () => ({ status: 'connected' }),
+      disconnect: async () => undefined,
+      resolveCredential: async () =>
+        new OpaqueCredentialHandle('direct', 'fixture-direct'),
+      withCredential: async <T>(
+        _handle: OpaqueCredentialHandle,
+        operation: (secret: string) => Promise<T>,
+      ) => operation('fixture-secret'),
+    };
+    const router = new ModelRouter({
+      routes: [directRoute],
+      auth,
+      fetchImpl: async (_url, init) => {
+        providerBody = JSON.parse(String(init?.body)) as Record<
+          string,
+          unknown
+        >;
+        return new Response(
+          JSON.stringify({
+            id: 'request_1',
+            choices: [{ message: { content: 'ok' } }],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      },
+    });
+    await router.complete({
+      task: 'offline_review',
+      routeId: 'direct',
+      projection: createAuthorizedModelProjection(
+        attestation('direct_provider_only'),
       ),
-    ).toEqual({ allowed: false, reason: 'external_processing_not_allowed' });
-    expect(
-      authorizeRoute(
-        directRoute,
-        request(policy('public', { embargoUntil: '2026-08-30T00:00:00.000Z' })),
-        now,
-      ),
-    ).toEqual({ allowed: false, reason: 'record_embargo_active' });
-    expect(
-      authorizeRoute(
-        directRoute,
-        request(policy('public', { embargoUntil: 'not-a-date' })),
-        now,
-      ),
-    ).toEqual({ allowed: false, reason: 'record_embargo_active' });
+    });
+    const captured = providerBody as Record<string, unknown> | null;
+    if (!captured) throw new Error('provider body was not captured');
+    const messages = captured.messages as Array<{
+      role: string;
+      content: string;
+    }>;
+    expect(messages).toHaveLength(2);
+    expect(messages[0].content).toContain(
+      'authorized redacted archive projection',
+    );
+    expect(messages[1].content).toContain('authorized_model_projection');
+    expect(messages[1].content).not.toContain('external_fixture');
   });
 });

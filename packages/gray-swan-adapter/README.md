@@ -15,3 +15,5 @@ The parser records every selector candidate used for every normalized field. Mis
 required fields, unknown record kinds, duplicate ids, and id mismatches all fail closed.
 
 Public entry point: `src/index.ts`.
+
+`src/connector.ts` supplies the first `ArchiveConnectorRegistry` registration facade. It delegates contract loading, parsing, blocker detection, and record validation to this package's existing functions. Collection remains owned by the existing guarded Gray Swan worker; the facade neither exposes Playwright nor implements a second worker.
