@@ -65,3 +65,6 @@ next-env.d.ts
 /arena-archivist-data/
 /runtime/
 /.arena-runtime/
+
+# local agent coordination
+/.merge-coordination/
