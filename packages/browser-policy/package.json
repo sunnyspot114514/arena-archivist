@@ -1,0 +1,10 @@
+{
+  "name": "@arena-archivist/browser-policy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./index.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test browser-policy.test.mjs"
+  }
+}

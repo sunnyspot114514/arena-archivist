@@ -1,0 +1,372 @@
+{
+  "schemaVersion": 1,
+  "contractId": "gray-swan-arena",
+  "contractVersion": "fixture-v1",
+  "compatibility": {
+    "status": "fixture-baseline",
+    "capturedAt": null,
+    "pageBuild": null,
+    "notes": "Offline contract only. Replace or promote candidates after a user-authorized fixture capture; it is not a claim about the current live DOM."
+  },
+  "index": {
+    "root": [
+      { "id": "fixture.index.root", "selector": "[data-aa-index]" },
+      {
+        "id": "candidate.index.list",
+        "selector": "[data-testid=previous-records]"
+      }
+    ],
+    "item": [
+      { "id": "fixture.index.item", "selector": "[data-aa-index-item]" },
+      { "id": "candidate.index.item", "selector": "[data-testid=record-card]" }
+    ],
+    "hrefPatterns": {
+      "chat": "^/arena/archive/chat_[A-Za-z0-9_-]+$",
+      "submission": "^/arena/archive/submission_[A-Za-z0-9_-]+$",
+      "profile": "^/arena/archive/profile_[A-Za-z0-9_-]+$"
+    },
+    "fields": {
+      "externalId": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "fixture.index.id",
+            "selector": ":scope",
+            "source": "attribute",
+            "attribute": "data-record-id"
+          }
+        ]
+      },
+      "kind": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "fixture.index.kind",
+            "selector": ":scope",
+            "source": "attribute",
+            "attribute": "data-record-kind"
+          }
+        ]
+      },
+      "href": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "fixture.index.href",
+            "selector": "a[data-aa-record-link]",
+            "source": "attribute",
+            "attribute": "href"
+          }
+        ]
+      },
+      "title": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "fixture.index.title",
+            "selector": "[data-aa-record-title]",
+            "source": "text"
+          }
+        ]
+      },
+      "updatedAt": {
+        "required": false,
+        "candidates": [
+          {
+            "id": "fixture.index.updated",
+            "selector": "time[data-aa-record-updated]",
+            "source": "attribute",
+            "attribute": "datetime"
+          }
+        ]
+      }
+    }
+  },
+  "records": {
+    "chat": {
+      "root": [
+        { "id": "fixture.chat.root", "selector": "[data-aa-record=chat]" }
+      ],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.chat.id",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-id"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.chat.title",
+              "selector": "[data-aa-title]",
+              "source": "text"
+            }
+          ]
+        },
+        "behavior": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.chat.behavior",
+              "selector": "[data-aa-behavior]",
+              "source": "text"
+            }
+          ]
+        },
+        "modelAlias": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.chat.model",
+              "selector": "[data-aa-model]",
+              "source": "text"
+            }
+          ]
+        },
+        "status": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.chat.status",
+              "selector": "[data-aa-status]",
+              "source": "text"
+            }
+          ]
+        }
+      },
+      "messages": {
+        "item": [
+          { "id": "fixture.chat.message", "selector": "[data-aa-message]" }
+        ],
+        "fields": {
+          "role": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "fixture.chat.message.role",
+                "selector": ":scope",
+                "source": "attribute",
+                "attribute": "data-role"
+              }
+            ]
+          },
+          "body": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "fixture.chat.message.body",
+                "selector": "[data-aa-message-body]",
+                "source": "text"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "submission": {
+      "root": [
+        {
+          "id": "fixture.submission.root",
+          "selector": "[data-aa-record=submission]"
+        }
+      ],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.submission.id",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-id"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.submission.title",
+              "selector": "[data-aa-title]",
+              "source": "text"
+            }
+          ]
+        },
+        "behavior": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.submission.behavior",
+              "selector": "[data-aa-behavior]",
+              "source": "text"
+            }
+          ]
+        },
+        "modelAlias": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.submission.model",
+              "selector": "[data-aa-model]",
+              "source": "text"
+            }
+          ]
+        },
+        "status": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.submission.status",
+              "selector": "[data-aa-status]",
+              "source": "text"
+            }
+          ]
+        }
+      },
+      "messages": {
+        "item": [
+          {
+            "id": "fixture.submission.message",
+            "selector": "[data-aa-message]"
+          }
+        ],
+        "fields": {
+          "role": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "fixture.submission.message.role",
+                "selector": ":scope",
+                "source": "attribute",
+                "attribute": "data-role"
+              }
+            ]
+          },
+          "body": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "fixture.submission.message.body",
+                "selector": "[data-aa-message-body]",
+                "source": "text"
+              }
+            ]
+          }
+        }
+      },
+      "judgeResults": {
+        "item": [
+          {
+            "id": "fixture.submission.judge",
+            "selector": "[data-aa-judge-result]"
+          }
+        ],
+        "fields": {
+          "label": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "fixture.submission.judge.label",
+                "selector": "[data-aa-judge-label]",
+                "source": "text"
+              }
+            ]
+          },
+          "score": {
+            "required": false,
+            "candidates": [
+              {
+                "id": "fixture.submission.judge.score",
+                "selector": "[data-aa-judge-score]",
+                "source": "text"
+              }
+            ]
+          },
+          "explanation": {
+            "required": false,
+            "candidates": [
+              {
+                "id": "fixture.submission.judge.explanation",
+                "selector": "[data-aa-judge-explanation]",
+                "source": "text"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "profile": {
+      "root": [
+        { "id": "fixture.profile.root", "selector": "[data-aa-record=profile]" }
+      ],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.profile.id",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-id"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "fixture.profile.title",
+              "selector": "[data-aa-title]",
+              "source": "text"
+            }
+          ]
+        },
+        "status": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "fixture.profile.status",
+              "selector": "[data-aa-status]",
+              "source": "text"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "blockers": {
+    "loginRequired": [
+      { "id": "fixture.blocker.login", "selector": "[data-aa-blocker=login]" },
+      {
+        "id": "candidate.blocker.login",
+        "selector": "[data-testid=login-form]"
+      }
+    ],
+    "captcha": [
+      {
+        "id": "fixture.blocker.captcha",
+        "selector": "[data-aa-blocker=captcha]"
+      },
+      {
+        "id": "candidate.blocker.captcha",
+        "selector": "iframe[title*=captcha]"
+      }
+    ],
+    "botChallenge": [
+      {
+        "id": "fixture.blocker.bot",
+        "selector": "[data-aa-blocker=bot-challenge]"
+      },
+      {
+        "id": "candidate.blocker.bot",
+        "selector": "[data-testid=bot-challenge]"
+      }
+    ]
+  }
+}

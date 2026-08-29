@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arena-archivist.local/schemas/annotation.schema.json",
+  "title": "Model annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recordId",
+    "taxonomyVersion",
+    "promptVersion",
+    "provider",
+    "model",
+    "labels",
+    "confidence",
+    "reviewStatus"
+  ],
+  "properties": {
+    "recordId": { "type": "string", "minLength": 1 },
+    "taxonomyVersion": { "type": "string", "minLength": 1 },
+    "promptVersion": { "type": "string", "minLength": 1 },
+    "provider": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "labels": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "authority_spoofing",
+          "roleplay",
+          "context_laundering",
+          "instruction_hierarchy_confusion",
+          "format_smuggling",
+          "semantic_indirection",
+          "goal_substitution",
+          "multi_turn_escalation",
+          "judge_targeting",
+          "concealment",
+          "indirect_injection"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "reviewStatus": {
+      "enum": ["unreviewed", "accepted", "rejected", "edited"]
+    },
+    "createdAt": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arena-archivist.local/schemas/submission.schema.json",
+  "title": "Archived submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "platform",
+    "externalSubmissionId",
+    "capturedAt",
+    "dataPolicy",
+    "externalProcessingAllowed",
+    "source"
+  ],
+  "properties": {
+    "platform": { "const": "gray_swan" },
+    "externalSubmissionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "externalChatId": { "type": ["string", "null"], "maxLength": 512 },
+    "challengeExternalId": { "type": ["string", "null"], "maxLength": 512 },
+    "behaviorExternalId": { "type": ["string", "null"], "maxLength": 512 },
+    "modelLabel": { "type": ["string", "null"], "maxLength": 512 },
+    "prompt": { "type": ["string", "null"] },
+    "outcome": { "enum": ["success", "failure", "unknown"] },
+    "attemptOrdinal": { "type": ["integer", "null"], "minimum": 1 },
+    "capturedAt": { "type": "string", "format": "date-time" },
+    "judge": {
+      "type": ["object", "null"],
+      "properties": {
+        "label": { "type": ["string", "null"] },
+        "score": { "type": ["number", "null"] },
+        "explanation": { "type": ["string", "null"] }
+      }
+    },
+    "dataPolicy": {
+      "enum": [
+        "local_only",
+        "direct_provider_only",
+        "zdr_router_allowed",
+        "public"
+      ]
+    },
+    "embargoUntil": { "type": ["string", "null"], "format": "date-time" },
+    "externalProcessingAllowed": { "type": "boolean" },
+    "redactionVersion": { "type": "string" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "contentHash", "parserVersion"],
+      "properties": {
+        "artifactId": { "type": "string", "minLength": 1 },
+        "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "parserVersion": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

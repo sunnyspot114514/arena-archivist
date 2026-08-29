@@ -1,0 +1,23 @@
+version: model-routing-v1
+defaultRoute: none
+
+routes:
+  parser_repair:
+    providers: [deepseek, minimax]
+    requireStructuredOutput: true
+  offline_review:
+    providers: [minimax, deepseek]
+  embeddings:
+    providers: [nvidia]
+  sampled_cross_check:
+    providers: [openrouter_zdr]
+    sampleRate: 0.15
+
+openrouter:
+  enabledForRawArchive: false
+  zeroDataRetentionRequired: true
+  promptLogging: false
+
+fallback:
+  automatic: false
+  requireExplicitUserApproval: true

@@ -1,0 +1,267 @@
+import type {
+  AuthBroker,
+  CredentialExecutor,
+  OpaqueCredentialHandle,
+} from '../../auth-broker/src/index';
+
+export type DataPolicy =
+  | 'local_only'
+  | 'direct_provider_only'
+  | 'zdr_router_allowed'
+  | 'public';
+
+export type ModelTask =
+  | 'parser_repair'
+  | 'offline_review'
+  | 'embeddings'
+  | 'sampled_cross_check';
+
+export type ProviderRoute = {
+  id: string;
+  provider: string;
+  kind: 'direct' | 'router';
+  baseUrl: string;
+  model: string;
+  connectionId: string;
+  allowedTasks: readonly ModelTask[];
+  zeroDataRetention: boolean;
+  promptLogging: boolean;
+  enabled: boolean;
+  additionalHeaders?: Readonly<Record<string, string>>;
+  additionalBody?: Readonly<Record<string, unknown>>;
+};
+
+export type RecordPolicy = {
+  level: DataPolicy;
+  externalProcessingAllowed: boolean;
+  embargoUntil: string | null;
+  redactionVersion: string;
+};
+
+export type ChatMessage = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+};
+
+export type CompletionRequest = {
+  task: ModelTask;
+  routeId: string;
+  recordPolicy: RecordPolicy;
+  messages: readonly ChatMessage[];
+  /** Router routes require an explicit redacted analysis copy. */
+  redacted: boolean;
+  temperature?: number;
+  maxTokens?: number;
+  responseFormat?: 'text' | 'json_object';
+};
+
+export type CompletionResult = {
+  routeId: string;
+  provider: string;
+  model: string;
+  content: string;
+  requestId: string | null;
+};
+
+export type RouteDecision =
+  | { allowed: true; reason: 'policy_allowed' }
+  | { allowed: false; reason: string };
+
+export function authorizeRoute(
+  route: ProviderRoute,
+  request: Pick<CompletionRequest, 'task' | 'recordPolicy' | 'redacted'>,
+  now = new Date(),
+): RouteDecision {
+  if (!route.enabled) {
+    return { allowed: false, reason: 'route_disabled' };
+  }
+  if (!route.allowedTasks.includes(request.task)) {
+    return { allowed: false, reason: 'task_not_allowed_on_route' };
+  }
+  if (request.recordPolicy.level === 'local_only') {
+    return { allowed: false, reason: 'record_is_local_only' };
+  }
+  if (!request.recordPolicy.externalProcessingAllowed) {
+    return { allowed: false, reason: 'external_processing_not_allowed' };
+  }
+  if (request.recordPolicy.embargoUntil) {
+    const embargo = new Date(request.recordPolicy.embargoUntil);
+    if (!Number.isFinite(embargo.getTime()) || embargo > now) {
+      return { allowed: false, reason: 'record_embargo_active' };
+    }
+  }
+  if (
+    request.recordPolicy.level === 'direct_provider_only' &&
+    route.kind !== 'direct'
+  ) {
+    return { allowed: false, reason: 'router_disallowed_by_record_policy' };
+  }
+  if (route.kind === 'router') {
+    if (
+      request.recordPolicy.level !== 'zdr_router_allowed' &&
+      request.recordPolicy.level !== 'public'
+    ) {
+      return { allowed: false, reason: 'router_disallowed_by_record_policy' };
+    }
+    if (!route.zeroDataRetention || route.promptLogging) {
+      return { allowed: false, reason: 'router_privacy_requirements_not_met' };
+    }
+    if (!request.redacted) {
+      return { allowed: false, reason: 'router_requires_redacted_copy' };
+    }
+  }
+
+  return { allowed: true, reason: 'policy_allowed' };
+}
+
+type OpenAiCompatibleResponse = {
+  id?: string;
+  choices?: Array<{ message?: { content?: string } }>;
+  error?: { message?: string };
+};
+
+export class ModelRouter {
+  readonly #routes: ReadonlyMap<string, ProviderRoute>;
+  readonly #auth: AuthBroker & CredentialExecutor;
+  readonly #fetch: typeof fetch;
+
+  constructor(options: {
+    routes: readonly ProviderRoute[];
+    auth: AuthBroker & CredentialExecutor;
+    fetchImpl?: typeof fetch;
+  }) {
+    this.#routes = new Map(options.routes.map((route) => [route.id, route]));
+    this.#auth = options.auth;
+    this.#fetch = options.fetchImpl ?? fetch;
+  }
+
+  listRoutes(): Array<Omit<ProviderRoute, 'additionalHeaders'>> {
+    return [...this.#routes.values()].map(
+      ({ additionalHeaders: _headers, ...route }) => route,
+    );
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResult> {
+    const route = this.#routes.get(request.routeId);
+    if (!route) {
+      throw new Error(`Unknown model route: ${request.routeId}`);
+    }
+
+    const decision = authorizeRoute(route, request);
+    if (!decision.allowed) {
+      throw new Error(`Model route denied: ${decision.reason}`);
+    }
+
+    const handle: OpaqueCredentialHandle = await this.#auth.resolveCredential(
+      route.connectionId,
+    );
+
+    return this.#auth.withCredential(handle, async (credential) => {
+      const response = await this.#fetch(
+        `${route.baseUrl.replace(/\/$/, '')}/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${credential}`,
+            'content-type': 'application/json',
+            ...route.additionalHeaders,
+          },
+          body: JSON.stringify({
+            model: route.model,
+            messages: request.messages,
+            temperature: request.temperature ?? 0,
+            max_tokens: request.maxTokens,
+            response_format:
+              request.responseFormat === 'json_object'
+                ? { type: 'json_object' }
+                : undefined,
+            ...route.additionalBody,
+          }),
+          signal: AbortSignal.timeout(60_000),
+        },
+      );
+
+      const payload = (await response.json()) as OpenAiCompatibleResponse;
+      if (!response.ok) {
+        throw new Error(
+          `Provider request failed (${response.status}): ${payload.error?.message ?? 'unknown error'}`,
+        );
+      }
+
+      const content = payload.choices?.[0]?.message?.content;
+      if (typeof content !== 'string') {
+        throw new Error('Provider returned no completion content');
+      }
+
+      return {
+        routeId: route.id,
+        provider: route.provider,
+        model: route.model,
+        content,
+        requestId: payload.id ?? null,
+      };
+    });
+  }
+}
+
+export function defaultProviderRoutes(): ProviderRoute[] {
+  return [
+    {
+      id: 'deepseek-direct',
+      provider: 'deepseek',
+      kind: 'direct',
+      baseUrl: process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1',
+      model: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
+      connectionId: 'deepseek',
+      allowedTasks: ['parser_repair', 'offline_review'],
+      zeroDataRetention: false,
+      promptLogging: true,
+      enabled: Boolean(process.env.DEEPSEEK_API_KEY),
+    },
+    {
+      id: 'minimax-direct',
+      provider: 'minimax',
+      kind: 'direct',
+      baseUrl: process.env.MINIMAX_BASE_URL ?? '',
+      model: process.env.MINIMAX_MODEL ?? '',
+      connectionId: 'minimax',
+      allowedTasks: ['parser_repair', 'offline_review'],
+      zeroDataRetention: false,
+      promptLogging: true,
+      enabled: Boolean(
+        process.env.MINIMAX_API_KEY &&
+        process.env.MINIMAX_BASE_URL &&
+        process.env.MINIMAX_MODEL,
+      ),
+    },
+    {
+      id: 'nvidia-direct',
+      provider: 'nvidia',
+      kind: 'direct',
+      baseUrl:
+        process.env.NVIDIA_BASE_URL ?? 'https://integrate.api.nvidia.com/v1',
+      model: process.env.NVIDIA_MODEL ?? '',
+      connectionId: 'nvidia',
+      allowedTasks: ['embeddings', 'parser_repair'],
+      zeroDataRetention: false,
+      promptLogging: true,
+      enabled: Boolean(process.env.NVIDIA_API_KEY && process.env.NVIDIA_MODEL),
+    },
+    {
+      id: 'openrouter-zdr',
+      provider: 'openrouter',
+      kind: 'router',
+      baseUrl:
+        process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1',
+      model: process.env.OPENROUTER_MODEL ?? '',
+      connectionId: 'openrouter',
+      allowedTasks: ['sampled_cross_check'],
+      zeroDataRetention: true,
+      promptLogging: false,
+      enabled: Boolean(
+        process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_MODEL,
+      ),
+      additionalBody: { provider: { data_collection: 'deny' } },
+    },
+  ];
+}

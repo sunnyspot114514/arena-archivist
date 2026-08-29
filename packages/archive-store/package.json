@@ -1,0 +1,10 @@
+{
+  "name": "@arena-archivist/archive-store",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./index.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test archive-store.test.mjs"
+  }
+}

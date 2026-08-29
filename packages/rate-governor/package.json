@@ -1,0 +1,10 @@
+{
+  "name": "@arena-archivist/rate-governor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./index.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test rate-governor.test.mjs"
+  }
+}

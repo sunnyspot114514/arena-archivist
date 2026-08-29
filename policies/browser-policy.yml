@@ -1,0 +1,57 @@
+version: browser-policy-v1
+mode: fail_closed
+
+browser:
+  concurrency: 1
+  maxTabs: 1
+  visible: true
+  dedicatedProfileRequired: true
+
+origins:
+  collect:
+    - https://app.grayswan.ai
+  authModeAllowsUserNavigation: true
+
+semanticActions:
+  allow:
+    - session_status
+    - open_previous_chats
+    - open_submissions
+    - open_profile
+    - read_visible_record
+    - navigate_pagination
+    - save_local_copy
+  deny:
+    - send_message
+    - fill_attack_prompt
+    - submit_break
+    - retry_attack
+    - upload_payload
+    - delete_chat
+    - change_profile
+
+dom:
+  denyElements:
+    - input
+    - textarea
+    - '[contenteditable="true"]'
+    - 'input[type="file"]'
+  denyTextPatterns:
+    - '(?i)^send$'
+    - '(?i)^submit$'
+    - '(?i)submit break'
+
+network:
+  allowedMethods: [GET, HEAD, OPTIONS]
+  allowKnownReadPost: true
+  allowGraphqlQuery: true
+  denyGraphqlMutation: true
+  denyUnknownMutation: true
+
+stopImmediatelyOn:
+  - HTTP_429
+  - HTTP_403
+  - captcha
+  - bot_challenge
+  - login_required
+  - unexpected_mutation

@@ -1,0 +1,23 @@
+version: data-policy-v1
+default: local_only
+
+levels:
+  local_only:
+    externalProviders: []
+  direct_provider_only:
+    requireExternalProcessingAllowed: true
+    routes: [deepseek, minimax, nvidia]
+  zdr_router_allowed:
+    requireExternalProcessingAllowed: true
+    routes: [deepseek, minimax, nvidia, openrouter_zdr]
+  public:
+    requireExternalProcessingAllowed: true
+    routes: [deepseek, minimax, nvidia, openrouter_zdr]
+
+embargo:
+  denyBeforeEmbargoUntil: true
+
+exports:
+  excludeBrowserProfile: true
+  excludeCredentials: true
+  requireSecretScan: true

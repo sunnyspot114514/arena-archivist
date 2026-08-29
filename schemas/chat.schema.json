@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arena-archivist.local/schemas/chat.schema.json",
+  "title": "Archived chat",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "platform",
+    "externalChatId",
+    "capturedAt",
+    "messages",
+    "dataPolicy",
+    "externalProcessingAllowed",
+    "source"
+  ],
+  "properties": {
+    "platform": { "const": "gray_swan" },
+    "externalChatId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "title": { "type": ["string", "null"], "maxLength": 2048 },
+    "challengeExternalId": { "type": ["string", "null"], "maxLength": 512 },
+    "behaviorExternalId": { "type": ["string", "null"], "maxLength": 512 },
+    "modelLabel": { "type": ["string", "null"], "maxLength": 512 },
+    "capturedAt": { "type": "string", "format": "date-time" },
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ordinal", "role", "content"],
+        "properties": {
+          "ordinal": { "type": "integer", "minimum": 0 },
+          "role": {
+            "enum": ["user", "assistant", "system", "tool", "unknown"]
+          },
+          "content": { "type": "string" },
+          "createdAt": { "type": ["string", "null"], "format": "date-time" }
+        }
+      }
+    },
+    "dataPolicy": {
+      "enum": [
+        "local_only",
+        "direct_provider_only",
+        "zdr_router_allowed",
+        "public"
+      ]
+    },
+    "embargoUntil": { "type": ["string", "null"], "format": "date-time" },
+    "externalProcessingAllowed": { "type": "boolean" },
+    "redactionVersion": { "type": "string" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "contentHash", "parserVersion"],
+      "properties": {
+        "artifactId": { "type": "string", "minLength": 1 },
+        "contentHash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "parserVersion": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

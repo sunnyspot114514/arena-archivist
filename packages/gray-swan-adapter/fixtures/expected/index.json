@@ -1,0 +1,18 @@
+{
+  "records": [
+    {
+      "externalId": "chat_001",
+      "kind": "chat",
+      "href": "/arena/archive/chat_001",
+      "title": "First synthetic chat",
+      "updatedAt": "2026-08-20T10:00:00Z"
+    },
+    {
+      "externalId": "submission_001",
+      "kind": "submission",
+      "href": "/arena/archive/submission_001",
+      "title": "Synthetic judged submission",
+      "updatedAt": "2026-08-21T11:30:00Z"
+    }
+  ]
+}

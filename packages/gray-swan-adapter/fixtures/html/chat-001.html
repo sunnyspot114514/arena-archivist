@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>First synthetic chat</title>
+    <meta name="csrf-token" content="fixture-secret-that-must-be-redacted" />
+  </head>
+  <body>
+    <main data-aa-record="chat" data-record-id="chat_001">
+      <h1 data-aa-title>First synthetic chat</h1>
+      <p data-aa-behavior>Instruction hierarchy</p>
+      <p data-aa-model>anonymous-model-a</p>
+      <p data-aa-status>complete</p>
+      <section data-aa-message data-role="user">
+        <p data-aa-message-body>
+          This archived text mentions captcha without being a live challenge.
+        </p>
+      </section>
+      <section data-aa-message data-role="assistant">
+        <p data-aa-message-body>
+          Synthetic response for deterministic parsing.
+        </p>
+      </section>
+    </main>
+    <script>
+      window.__AUTH__ = { sessionToken: 'fixture-secret' };
+    </script>
+  </body>
+</html>
