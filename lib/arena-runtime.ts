@@ -63,19 +63,30 @@ export type NvidiaProviderStatus = {
   availableModels: string[];
 };
 
-export type ArchiveListItem = {
+export type ArchiveOffsetListItem = {
   id: string;
   kind: 'chat' | 'submission';
   externalId: string;
+  platform: string;
   title: string | null;
   outcome: string | null;
   dataPolicy: string;
-  sourceHash?: string;
+  updatedAt: string;
+};
+
+export type ArchiveQueryItem = {
+  id: string;
+  kind: 'chat' | 'submission';
+  platform: string;
+  title: string | null;
+  outcome: string | null;
+  dataPolicy: string;
+  sourceHash: string;
   updatedAt: string;
 };
 
 export type ArchiveQueryPage = {
-  items: ArchiveListItem[];
+  items: ArchiveQueryItem[];
   nextCursor: string | null;
   queryHash: string;
   catalogGeneration: number;
@@ -137,7 +148,7 @@ export const arenaRuntime = {
       body: '{}',
     }),
   validateSession: () =>
-    runtimeRequest<{ session: string }>('/v1/session/validate', {
+    runtimeRequest<{ session: 'valid' | 'invalid' }>('/v1/session/validate', {
       method: 'POST',
       body: '{}',
     }),
@@ -169,7 +180,7 @@ export const arenaRuntime = {
       body: '{}',
     }),
   listRecords: (limit = 8) =>
-    runtimeRequest<{ items: ArchiveListItem[]; total: number }>(
+    runtimeRequest<{ items: ArchiveOffsetListItem[]; total: number }>(
       `/v1/records?limit=${limit}&offset=0`,
     ),
   queryRecords: (

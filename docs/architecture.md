@@ -35,6 +35,12 @@ The connector registry does not execute a generic browser. Registration runtime-
 - `PAUSED_HUMAN_AUTH`: the idle/handoff state when a session is missing or human action is required.
 - `DEMO_MODE`: runs the same parse, validate, record commit, and ledger path against repository fixtures without contacting Gray Swan.
 
+Live collection requires an explicit `AUTH_MODE → browser closed → session validation → COLLECT_MODE` transition. A Controller-level exclusive transition is acquired before the first asynchronous browser operation; live sync cannot consume the Profile until the validation browser has closed successfully and `valid` is committed. Browser/context initialization is compensating: a partially created persistent context is closed before the stable, path-free boundary error is returned. `login_required` revokes the validated state, while browser/challenge failures conservatively return it to `unknown`. The Dashboard applies the same gate, but `DEMO_MODE` remains available during human authentication because it uses repository fixtures and never opens the profile. Runtime startup reads the optional project-root `.env` before constructing configuration.
+
+The bundled `grayswan.live-v2.json` contract is intentionally route-specific. As verified on 2026-08-30, it covers only the `hazard-hunt-q3` challenge Chat archive: two unique, exact-text, read-only transitions open the history panel and select its Chat tab, then the worker opens a matched Chat link. Before snapshotting a detail page it waits for the reviewed behavior and user/assistant message structure to finish hydrating. No generic click API escapes the adapter. Submissions, profiles, additional list pages, and other challenge routes remain unsupported until separately reviewed.
+
+Network policy still aborts and audits denied optional telemetry. A denied third-party subresource, or the site's specifically reviewed same-origin `/ingest/flags/` analytics request, is nonfatal after it is blocked because it cannot mutate the archive source. Every other primary-origin write—including other `/ingest/*` paths—plus any denied document navigation, GraphQL mutation, or unknown state-changing request remains fatal and revokes the validated live session. Audit metadata may include only a query/hash-free endpoint path; request bodies and full URLs are not persisted.
+
 ## Worker state and durable action state
 
 The existing record worker keeps its deliberately narrow state machine:
@@ -53,11 +59,11 @@ proposal → validation → authorization → dispatch → observation
 any non-terminal phase → blocked | failed | cancelled
 ```
 
-`action_ledger_events` is append-only and sequences events by `(action_id, sequence)`. Every event also carries `sync_run_id`, input hash, payload hash, connector ID/version, and policy version. `action_ledger_actions` is a current-state index; it is not a replacement for the event history.
+`action_ledger_events` is append-only and sequences events by `(action_id, sequence)`. Every event also carries `sync_run_id`, input hash, payload hash, connector ID/version, and policy version. `action_authorizations` is a separate append-only grant: its authorization hash binds action/run, request hash, locally derived scope hash, policy and connector identity, principal/source/decision, and authorization time. Dispatch, successful settlement, and canonical record writes revalidate that row against the action; upgraded legacy actions without a v4 binding can only enter a non-success terminal (`blocked`, `failed`, or `cancelled`). The action row persists only an allowlisted request summary; arbitrary request bodies are hashed in memory and never stored. `action_ledger_actions` is a current-state index, not a replacement for either append-only history.
 
 On a successful run, observation, reconciliation, canonical action commit, and the terminal `sync_runs` update are written in one SQLite transaction. A stopped or failed run writes its explicit terminal action phase with the run terminal state. Startup recovery marks a formerly running action failed with `process_restarted` rather than blindly redispatching it.
 
-Individual records are still committed as they pass worker validation. Each record, its evidence references, `sync_record_commits` run/action link, run counter, and checkpoint advance form one atomic canonical-record transaction. Successful reconciliation requires the worker count, SQLite run counter, and linked non-unchanged record set to agree; the ledger stores a deterministic `recordSetHash` and `commitSetHash`. A mismatch rolls back observation/reconciliation and is settled as a failed action. The run-level `canonical_commit` attests that the resulting batch was observed and reconciled; it does not postpone already durable per-record commits.
+Individual records are still committed as they pass worker validation. An authorized run can enter this canonical transaction only while its action is in `dispatch`. Each record, its evidence references, append-only `sync_record_commits` run/action link, run counter, and checkpoint advance form one atomic canonical-record transaction. Successful reconciliation requires the worker count, SQLite run counter, and linked non-unchanged record set to agree; the ledger stores a deterministic `recordSetHash` and `commitSetHash`. A mismatch rolls back observation/reconciliation and is settled as a failed action. The run-level `canonical_commit` attests that the resulting batch was observed and reconciled; it does not postpone already durable per-record commits.
 
 ## Canonical data and recovery
 
@@ -80,15 +86,15 @@ If capture or parsing fails before `commitRecord`, no checkpoint advances. If a 
 
 Browsing and archival do not require an LLM. A provider request can only carry an `AuthorizedModelProjection` produced locally from a stored record:
 
-- the payload is a fixed allowlist of record summary, messages, judge results, selected attributes, and hash-only provenance;
-- email, phone, credential/token, private-key, and URL patterns are deterministically replaced;
-- remote IDs, source URLs, selector traces, evidence paths, and artifact metadata are omitted;
-- the projection carries `sourceHash`, `policyVersion`, and `projectionHash`;
+- the provider payload is a fixed allowlist of record summary, messages, judge results, selected attributes, and an explicit allowed/removed sensitivity-class manifest;
+- email, phone, quoted/unquoted credential/token, private-key, and URL patterns are deterministically replaced; structured display roles/judge names use source-scoped stable pseudonyms;
+- remote IDs, source URLs, selector/parser provenance, evidence paths, attachment names, and artifact metadata/hashes are omitted from provider content;
+- the local authorization envelope carries deterministic `projectionId`, `sourceRecordId`, `sourceHash`, an explicit payload `contentHash`, `policyVersion`, and `projectionHash`;
 - authorization carries the stored data policy plus `policyHash` and `authorizationHash`;
-- the generator requires a deep-frozen, module-branded attestation read from the current `ArchiveStore`; plain caller-authored records are rejected;
+- the generator requires a deep-frozen, module-branded attestation read from an open `ArchiveStore`; catalog identity/generation and current source/policy fields are revalidated at generation and provider dispatch, so policy/catalog changes revoke old objects;
 - a second module-private projection brand and hash recomputation reject serialized, cloned, tampered, or caller-authored projections.
 
-The model router no longer accepts caller messages, a caller-supplied record policy, or `redacted: true`. It builds a fixed instruction and serialized verified projection itself, then applies `local_only`, external-processing, embargo, direct-provider, and ZDR/logging gates.
+The model router no longer accepts caller messages, a caller-supplied record policy, or `redacted: true`. It snapshots the request once, and constructor-time validated provider routes are JSON-copied and deeply frozen before use. It validates the full local envelope, then serializes only its minimized payload beside a fixed instruction; projection/auth hashes and local authorization policy are not sent as model content. It then applies `local_only`, external-processing, embargo, direct-provider, and ZDR/logging gates against the same immutable projection/route later used for dispatch. Library-level provider routes keep a 60-second default deadline, while the built-in NVIDIA route explicitly allows 15 minutes and consumes bounded OpenAI-compatible SSE frames for slow reasoning models. Trusted route definitions may set a validated `requestTimeoutMs` between 1 millisecond and 30 minutes plus a `streamResponse` policy; both values are included in the immutable route snapshot. Reasoning deltas are not returned as completion content. The current Runtime controller does not instantiate `ModelRouter` or expose a completion endpoint: its NVIDIA control plane stores the managed credential, refreshes the catalog, and persists the selected model only; `analyze` remains deterministic and offline.
 
 ## Model-facing tools and local API
 

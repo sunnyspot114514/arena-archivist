@@ -1,0 +1,257 @@
+{
+  "schemaVersion": 2,
+  "contractId": "gray-swan-arena",
+  "contractVersion": "live-challenge-v2-2026-08-30",
+  "compatibility": {
+    "status": "verified",
+    "capturedAt": "2026-08-30T00:00:00.000Z",
+    "pageBuild": "sveltekit-route:/arena/challenge/[slug]",
+    "notes": "Selector-only contract derived from a user-authorized DOM inspection. The paired fixtures are synthetic and contain no account data, prompts, tokens, or captured page content."
+  },
+  "index": {
+    "preparation": {
+      "steps": [
+        {
+          "intent": "open_history_panel",
+          "selector": "button[type=button]",
+          "expectedTextPattern": "^Chats\\s+\\d+$"
+        },
+        {
+          "intent": "select_chat_tab",
+          "selector": "div[role=dialog] button",
+          "expectedTextPattern": "^Chats\\s+\\(\\d+\\)$"
+        }
+      ],
+      "readySelector": "div[role=dialog] a[href*=\"chatId=\"]",
+      "timeoutMs": 10000
+    },
+    "root": [
+      {
+        "id": "live.index.dialog",
+        "selector": "div[role=dialog][data-dialog-content]"
+      }
+    ],
+    "item": [
+      {
+        "id": "live.index.chat-link",
+        "selector": "a[href*=\"chatId=\"]"
+      }
+    ],
+    "hrefPatterns": {
+      "chat": "^/arena/challenge/hazard-hunt-q3\\?chatId=[a-f0-9]{24}$",
+      "submission": "^/unavailable/submission$",
+      "profile": "^/unavailable/profile$"
+    },
+    "fields": {
+      "externalId": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "live.index.chat-id",
+            "selector": ":scope",
+            "source": "url_query",
+            "attribute": "href",
+            "queryParam": "chatId"
+          }
+        ]
+      },
+      "kind": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "live.index.chat-kind",
+            "selector": ":scope",
+            "source": "constant",
+            "value": "chat"
+          }
+        ]
+      },
+      "href": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "live.index.href",
+            "selector": ":scope",
+            "source": "attribute",
+            "attribute": "href"
+          }
+        ]
+      },
+      "title": {
+        "required": true,
+        "candidates": [
+          {
+            "id": "live.index.title",
+            "selector": ":scope",
+            "source": "text"
+          }
+        ]
+      }
+    }
+  },
+  "records": {
+    "chat": {
+      "root": [{ "id": "live.chat.root", "selector": "main" }],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.chat.id-from-url",
+              "selector": ":scope",
+              "source": "url_query",
+              "queryParam": "chatId"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.chat.title",
+              "selector": "button[data-behavior-id][class*=\"bg-secondary\"]",
+              "source": "attribute",
+              "attribute": "data-behavior-id"
+            }
+          ]
+        },
+        "behavior": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.chat.behavior",
+              "selector": "button[data-behavior-id][class*=\"bg-secondary\"]",
+              "source": "attribute",
+              "attribute": "data-behavior-id"
+            }
+          ]
+        },
+        "modelAlias": {
+          "required": false,
+          "candidates": [
+            {
+              "id": "live.chat.config",
+              "selector": "[data-testid=\"challengeConfigPanelButton\"]",
+              "source": "text"
+            }
+          ]
+        }
+      },
+      "messages": {
+        "item": [
+          {
+            "id": "live.chat.message-union",
+            "selector": "div[data-testid=\"userMessage\"],div[data-testid=\"assistantMessage\"]"
+          }
+        ],
+        "fields": {
+          "role": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "live.chat.user-role",
+                "selector": ":scope[data-testid=\"userMessage\"]",
+                "source": "constant",
+                "value": "user"
+              },
+              {
+                "id": "live.chat.assistant-role",
+                "selector": ":scope[data-testid=\"assistantMessage\"]",
+                "source": "constant",
+                "value": "assistant"
+              }
+            ]
+          },
+          "body": {
+            "required": true,
+            "candidates": [
+              {
+                "id": "live.chat.message-body",
+                "selector": ":scope",
+                "source": "text"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "submission": {
+      "root": [
+        {
+          "id": "live.submission.unavailable",
+          "selector": "[data-aa-unavailable=submission]"
+        }
+      ],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.submission.id",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-id"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.submission.title",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-title"
+            }
+          ]
+        }
+      }
+    },
+    "profile": {
+      "root": [
+        {
+          "id": "live.profile.unavailable",
+          "selector": "[data-aa-unavailable=profile]"
+        }
+      ],
+      "fields": {
+        "externalId": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.profile.id",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-id"
+            }
+          ]
+        },
+        "title": {
+          "required": true,
+          "candidates": [
+            {
+              "id": "live.profile.title",
+              "selector": ":scope",
+              "source": "attribute",
+              "attribute": "data-record-title"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "blockers": {
+    "loginRequired": [
+      { "id": "live.blocker.login", "selector": "[data-testid=loginForm]" }
+    ],
+    "captcha": [
+      { "id": "live.blocker.captcha", "selector": "iframe[title*=captcha]" }
+    ],
+    "botChallenge": [
+      {
+        "id": "live.blocker.bot",
+        "selector": "[data-testid=botChallenge]"
+      }
+    ]
+  }
+}

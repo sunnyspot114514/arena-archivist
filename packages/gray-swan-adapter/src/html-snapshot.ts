@@ -141,6 +141,11 @@ interface SimpleSelector {
   readonly attributes: readonly AttributeSelector[];
 }
 
+interface ParsedSelector {
+  readonly scope: boolean;
+  readonly simple: SimpleSelector | null;
+}
+
 function parseAttributeSelector(source: string): AttributeSelector | null {
   const match =
     /^\s*([\w:-]+)\s*(?:(\*=|=)\s*(?:"([^"]*)"|'([^']*)'|([^\s]+?))\s*)?(i)?\s*$/i.exec(
@@ -170,6 +175,52 @@ function parseSimpleSelector(selector: string): SimpleSelector | null {
   }
   if (!match[1] && attributes.length === 0) return null;
   return { tagName: match[1]?.toLowerCase() ?? null, attributes };
+}
+
+function splitSelectorList(selector: string): readonly string[] | null {
+  const parts: string[] = [];
+  let start = 0;
+  let bracketDepth = 0;
+  let quote: '"' | "'" | null = null;
+
+  for (let index = 0; index < selector.length; index += 1) {
+    const character = selector[index];
+    if (quote) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === '[') bracketDepth += 1;
+    else if (character === ']') bracketDepth -= 1;
+    else if (character === ',' && bracketDepth === 0) {
+      const part = selector.slice(start, index).trim();
+      if (!part) return null;
+      parts.push(part);
+      start = index + 1;
+    }
+    if (bracketDepth < 0) return null;
+  }
+
+  const finalPart = selector.slice(start).trim();
+  if (!finalPart || bracketDepth !== 0 || quote) return null;
+  parts.push(finalPart);
+  return parts;
+}
+
+function parseSelector(selector: string): ParsedSelector | null {
+  const normalized = selector.trim();
+  if (normalized === ':scope') return { scope: true, simple: null };
+  if (normalized.startsWith(':scope')) {
+    const suffix = normalized.slice(':scope'.length);
+    if (!suffix.startsWith('[')) return null;
+    const simple = parseSimpleSelector(suffix);
+    return simple ? { scope: true, simple } : null;
+  }
+  const simple = parseSimpleSelector(normalized);
+  return simple ? { scope: false, simple } : null;
 }
 
 function matchesSimpleSelector(
@@ -237,11 +288,21 @@ class SnapshotElementImpl implements SnapshotElement {
   }
 
   queryAll(selector: string): readonly SnapshotElement[] {
-    if (selector.trim() === ':scope') return [this];
-    const parsed = parseSimpleSelector(selector);
-    if (!parsed) return [];
-    return descendants(this.node)
-      .filter((candidate) => matchesSimpleSelector(candidate, parsed))
+    const selectorList = splitSelectorList(selector);
+    if (!selectorList) return [];
+    const parsed = selectorList.map(parseSelector);
+    if (parsed.some((entry) => entry === null)) return [];
+
+    return [this.node, ...descendants(this.node)]
+      .filter((candidate) =>
+        parsed.some((entry) => {
+          if (!entry) return false;
+          if (entry.scope !== (candidate === this.node)) return false;
+          return entry.simple
+            ? matchesSimpleSelector(candidate, entry.simple)
+            : true;
+        }),
+      )
       .map((candidate) => new SnapshotElementImpl(candidate));
   }
 

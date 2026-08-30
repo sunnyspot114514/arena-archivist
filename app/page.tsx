@@ -32,6 +32,7 @@ import {
   type ArchiveQueryPage,
   type ArenaRuntimeStatus,
 } from '@/lib/arena-runtime';
+import { resolveLiveFlowState, syncSourceForLiveFlow } from '@/lib/live-flow';
 
 const navigation = [
   { label: '运行总览', icon: Radar, active: true },
@@ -95,13 +96,15 @@ export default function Home() {
   );
 
   const running = status?.run?.state === 'running';
-  const source: 'demo' | 'live' =
-    status?.browser.liveCollectionEnabled &&
-    status.browser.selectorContract === 'verified'
-      ? 'live'
-      : 'demo';
+  const liveFlow = resolveLiveFlowState(status?.browser);
+  const source = syncSourceForLiveFlow(liveFlow);
+  const syncBatchSize = source === 'live' ? 1 : 10;
+  const liveRunBudgetExhausted =
+    source === 'live' &&
+    status !== null &&
+    status.budget.runsToday >= status.budget.maxRunsPerDay;
   const runtimeMode = running
-    ? source === 'demo'
+    ? status?.run?.source === 'demo'
       ? 'DEMO_MODE'
       : 'COLLECT_MODE'
     : (status?.browser.mode ?? 'PAUSED_HUMAN_AUTH');
@@ -233,6 +236,30 @@ export default function Home() {
                     ? '打开三个登录标签页'
                     : '登录浏览器已打开'}
                 </Button>
+                {liveFlow === 'validate-session' ? (
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    disabled={!reachable || busy !== null || running}
+                    onClick={() =>
+                      void runAction(
+                        'validate',
+                        async () => {
+                          const result = await arenaRuntime.validateSession();
+                          if (result.session !== 'valid') {
+                            throw new Error(
+                              '登录状态无效，请重新打开登录浏览器完成登录。',
+                            );
+                          }
+                        },
+                        '登录状态已验证，可以开始只读同步。',
+                      )
+                    }
+                  >
+                    <ShieldCheck data-icon="inline-start" />
+                    验证登录状态
+                  </Button>
+                ) : null}
                 {running ? (
                   <Button
                     size="lg"
@@ -252,12 +279,17 @@ export default function Home() {
                 ) : (
                   <Button
                     size="lg"
-                    disabled={!reachable || busy !== null}
+                    disabled={
+                      !reachable ||
+                      busy !== null ||
+                      (source === 'live' && liveFlow !== 'ready') ||
+                      liveRunBudgetExhausted
+                    }
                     className="bg-command text-command-foreground hover:bg-command/88"
                     onClick={() =>
                       void runAction(
                         'sync',
-                        () => arenaRuntime.sync(10, source),
+                        () => arenaRuntime.sync(syncBatchSize, source),
                         source === 'demo'
                           ? '离线演示批次已启动，不会访问 Gray Swan。'
                           : '只读同步批次已启动。',
@@ -265,7 +297,11 @@ export default function Home() {
                     }
                   >
                     <Play data-icon="inline-start" fill="currentColor" />
-                    {source === 'demo' ? '运行离线演示' : '同步下一批 10 条'}
+                    {source === 'demo'
+                      ? '运行离线演示'
+                      : liveRunBudgetExhausted
+                        ? '今日真实同步额度已用完'
+                        : '只读同步下一条'}
                   </Button>
                 )}
               </div>
@@ -292,11 +328,15 @@ export default function Home() {
                   <CardDescription>
                     {running
                       ? `${status?.run?.source === 'demo' ? '离线 fixture' : 'Gray Swan'} · 已提交 ${status?.run?.committed ?? 0} / ${status?.run?.requested ?? 0}`
-                      : reachable
-                        ? source === 'demo'
-                          ? '真实采集默认关闭；可先运行完整离线演示。'
-                          : '等待你确认登录状态并手动开始新批次。'
-                        : '请先启动 localhost Runtime API。'}
+                      : !reachable
+                        ? '请先启动 localhost Runtime API。'
+                        : liveFlow === 'demo'
+                          ? '真实采集尚未配置 verified selector contract；可先运行完整离线演示。'
+                          : liveFlow === 'close-auth-browser'
+                            ? '登录完成后请关闭整个登录浏览器，再验证登录状态。'
+                            : liveFlow === 'validate-session'
+                              ? '请先验证专用浏览器 Profile 中的登录状态。'
+                              : '登录状态已验证，等待你手动开始新批次。'}
                   </CardDescription>
                   <CardAction>
                     <Badge
@@ -312,7 +352,7 @@ export default function Home() {
                     {[
                       [
                         '本次预算',
-                        String(status?.run?.requested ?? 10),
+                        String(status?.run?.requested ?? syncBatchSize),
                         '条新记录',
                       ],
                       [
@@ -458,7 +498,7 @@ export default function Home() {
                 </CardTitle>
                 <CardDescription>
                   通过稳定 keyset
-                  查询读取本地记录句柄；模型读取时另行生成确定性脱敏投影。
+                  查询读取本地记录句柄；模型语义工具只返回无正文投影收据，完整确定性投影仅在本地路由边界生成。
                 </CardDescription>
                 <CardAction>
                   <Badge variant="outline" className="font-mono text-[10px]">

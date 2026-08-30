@@ -20,7 +20,7 @@ import type {
   SelectorTrace,
 } from './types.js';
 
-export const GRAY_SWAN_PARSER_VERSION = '1.0.0';
+export const GRAY_SWAN_PARSER_VERSION = '1.1.0';
 
 interface SelectedElement {
   readonly element: SnapshotElement;
@@ -31,6 +31,11 @@ interface ExtractedValue {
   readonly value: string;
   readonly candidate: SelectorCandidate;
 }
+
+type ExtractionResult =
+  | { readonly status: 'found'; readonly extracted: ExtractedValue }
+  | { readonly status: 'missing' }
+  | { readonly status: 'invalid'; readonly message: string };
 
 function selectFirst(
   scope: SnapshotElement,
@@ -60,17 +65,64 @@ function selectAll(
 function extractValue(
   scope: SnapshotElement,
   field: FieldSelector,
-): ExtractedValue | null {
+  snapshotUrl: string,
+): ExtractionResult {
   const selected = selectFirst(scope, field.candidates);
-  if (!selected) return null;
-  const value =
-    selected.candidate.source === 'attribute'
-      ? selected.element.attribute(selected.candidate.attribute ?? '')
-      : selected.element.text;
-  const normalized = value?.replace(/\s+/g, ' ').trim() ?? '';
-  return normalized
-    ? { value: normalized, candidate: selected.candidate }
-    : null;
+  if (!selected) return { status: 'missing' };
+
+  let value: string | null | undefined;
+  if (selected.candidate.source === 'attribute') {
+    value = selected.element.attribute(selected.candidate.attribute ?? '');
+  } else if (selected.candidate.source === 'constant') {
+    value = selected.candidate.value;
+  } else if (selected.candidate.source === 'url_query') {
+    const urlValue = selected.candidate.attribute
+      ? selected.element.attribute(selected.candidate.attribute)
+      : snapshotUrl;
+    if (!urlValue) {
+      return {
+        status: 'invalid',
+        message: 'URL query extraction source was empty',
+      };
+    }
+    let url: URL;
+    try {
+      url = new URL(urlValue, snapshotUrl);
+    } catch {
+      return {
+        status: 'invalid',
+        message: 'URL query extraction source was not a valid URL',
+      };
+    }
+    const queryParam = selected.candidate.queryParam ?? '';
+    const queryValues = url.searchParams.getAll(queryParam);
+    if (queryValues.length !== 1) {
+      return {
+        status: 'invalid',
+        message: `URL query parameter ${queryParam} must occur exactly once`,
+      };
+    }
+    value = queryValues[0];
+  } else {
+    value = selected.element.text;
+  }
+
+  const normalized =
+    selected.candidate.source === 'url_query'
+      ? (value?.trim() ?? '')
+      : (value?.replace(/\s+/g, ' ').trim() ?? '');
+  if (!normalized) {
+    return selected.candidate.source === 'url_query'
+      ? {
+          status: 'invalid',
+          message: 'URL query extraction produced an empty value',
+        }
+      : { status: 'missing' };
+  }
+  return {
+    status: 'found',
+    extracted: { value: normalized, candidate: selected.candidate },
+  };
 }
 
 function trace(field: string, extracted: ExtractedValue): SelectorTrace {
@@ -87,6 +139,10 @@ function missingField(field: string): ParseIssue {
     field,
     message: `Required field ${field} was not found`,
   };
+}
+
+function invalidField(field: string, message: string): ParseIssue {
+  return { code: 'field_invalid', field, message };
 }
 
 function parseKind(value: string): RecordKind | null {
@@ -135,23 +191,57 @@ export function parseIndexSnapshot(
   const ids = new Set<string>();
 
   for (const [ordinal, item] of itemSelection.elements.entries()) {
-    const values = {
-      externalId: extractValue(item, contract.index.fields.externalId),
-      kind: extractValue(item, contract.index.fields.kind),
-      href: extractValue(item, contract.index.fields.href),
-      title: extractValue(item, contract.index.fields.title),
+    const extractions = {
+      externalId: extractValue(
+        item,
+        contract.index.fields.externalId,
+        snapshot.url,
+      ),
+      kind: extractValue(item, contract.index.fields.kind, snapshot.url),
+      href: extractValue(item, contract.index.fields.href, snapshot.url),
+      title: extractValue(item, contract.index.fields.title, snapshot.url),
       updatedAt: contract.index.fields.updatedAt
-        ? extractValue(item, contract.index.fields.updatedAt)
-        : null,
+        ? extractValue(item, contract.index.fields.updatedAt, snapshot.url)
+        : ({ status: 'missing' } as const),
+    };
+    const values = {
+      externalId:
+        extractions.externalId.status === 'found'
+          ? extractions.externalId.extracted
+          : null,
+      kind:
+        extractions.kind.status === 'found' ? extractions.kind.extracted : null,
+      href:
+        extractions.href.status === 'found' ? extractions.href.extracted : null,
+      title:
+        extractions.title.status === 'found'
+          ? extractions.title.extracted
+          : null,
+      updatedAt:
+        extractions.updatedAt.status === 'found'
+          ? extractions.updatedAt.extracted
+          : null,
     };
 
     for (const fieldName of ['externalId', 'kind', 'href', 'title'] as const) {
       const value = values[fieldName];
-      if (!value) issues.push(missingField(`index[${ordinal}].${fieldName}`));
-      else traces.push(trace(`index[${ordinal}].${fieldName}`, value));
+      const fieldPath = `index[${ordinal}].${fieldName}`;
+      const extraction = extractions[fieldName];
+      if (extraction.status === 'invalid') {
+        issues.push(invalidField(fieldPath, extraction.message));
+      } else if (!value) issues.push(missingField(fieldPath));
+      else traces.push(trace(fieldPath, value));
     }
-    if (values.updatedAt)
+    if (extractions.updatedAt.status === 'invalid') {
+      issues.push(
+        invalidField(
+          `index[${ordinal}].updatedAt`,
+          extractions.updatedAt.message,
+        ),
+      );
+    } else if (values.updatedAt) {
       traces.push(trace(`index[${ordinal}].updatedAt`, values.updatedAt));
+    }
     if (!values.externalId || !values.kind || !values.href || !values.title)
       continue;
 
@@ -210,6 +300,7 @@ function parseRepeated(
   root: SnapshotElement,
   repeated: RepeatedFieldSelector | undefined,
   path: string,
+  snapshotUrl: string,
 ): {
   readonly values: readonly Readonly<Record<string, string | null>>[];
   readonly trace: readonly SelectorTrace[];
@@ -231,12 +322,15 @@ function parseRepeated(
   for (const [ordinal, item] of selected.elements.entries()) {
     const row: Record<string, string | null> = {};
     for (const [fieldName, field] of Object.entries(repeated.fields)) {
-      const extracted = extractValue(item, field);
+      const extraction = extractValue(item, field, snapshotUrl);
+      const fieldPath = `${path}[${ordinal}].${fieldName}`;
+      const extracted =
+        extraction.status === 'found' ? extraction.extracted : null;
       row[fieldName] = extracted?.value ?? null;
-      if (extracted)
-        traces.push(trace(`${path}[${ordinal}].${fieldName}`, extracted));
-      else if (field.required)
-        issues.push(missingField(`${path}[${ordinal}].${fieldName}`));
+      if (extracted) traces.push(trace(fieldPath, extracted));
+      else if (extraction.status === 'invalid') {
+        issues.push(invalidField(fieldPath, extraction.message));
+      } else if (field.required) issues.push(missingField(fieldPath));
     }
     values.push(row);
   }
@@ -275,21 +369,28 @@ export function parseRecordSnapshot(
   const fieldValues: Record<string, string | null> = {};
 
   for (const [fieldName, field] of Object.entries(recordContract.fields)) {
-    const extracted = extractValue(root.element, field);
+    const extraction = extractValue(root.element, field, snapshot.url);
+    const fieldPath = `record.${fieldName}`;
+    const extracted =
+      extraction.status === 'found' ? extraction.extracted : null;
     fieldValues[fieldName] = extracted?.value ?? null;
-    if (extracted) traces.push(trace(`record.${fieldName}`, extracted));
-    else if (field.required) issues.push(missingField(`record.${fieldName}`));
+    if (extracted) traces.push(trace(fieldPath, extracted));
+    else if (extraction.status === 'invalid') {
+      issues.push(invalidField(fieldPath, extraction.message));
+    } else if (field.required) issues.push(missingField(fieldPath));
   }
 
   const messages = parseRepeated(
     root.element,
     recordContract.messages,
     'record.messages',
+    snapshot.url,
   );
   const judgeResults = parseRepeated(
     root.element,
     recordContract.judgeResults,
     'record.judgeResults',
+    snapshot.url,
   );
   issues.push(...messages.issues, ...judgeResults.issues);
   traces.push(...messages.trace, ...judgeResults.trace);

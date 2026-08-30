@@ -1,14 +1,165 @@
 import { describe, expect, it } from 'vitest';
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { ArenaRuntimeController } from '../src/controller';
+import {
+  applyTrailingPolicyViolation,
+  ArenaRuntimeController,
+  classifyWorkerSettlement,
+  sessionAfterLiveWorkerResult,
+} from '../src/controller';
 import { loadRuntimeConfig } from '../src/config';
 import { ArchiveStore } from '../../../packages/archive-store/index';
 
 describe('offline runtime lifecycle', () => {
+  it('revokes a validated session when a live worker loses authentication', () => {
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'login_required',
+      }),
+    ).toBe('invalid');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'captcha',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'unexpected_mutation',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'parser_mismatch',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'completed',
+        stopReason: null,
+      }),
+    ).toBe('valid');
+  });
+
+  it('turns a trailing primary denial into a stopped worker result', () => {
+    const completed = {
+      status: 'completed' as const,
+      committed: 1,
+      skippedKnown: 0,
+      stopReason: null,
+      visitedStates: ['AUTH_CHECK', 'COMMIT'] as const,
+    };
+    expect(
+      applyTrailingPolicyViolation(completed, {
+        allowed: false,
+        reason: 'graphql_endpoint_denied',
+        method: 'POST',
+        origin: 'https://app.grayswan.invalid',
+        resourceType: 'fetch',
+        endpointPath: '/api/unknown',
+      }),
+    ).toMatchObject({
+      status: 'stopped',
+      stopReason: 'unexpected_mutation',
+      committed: 1,
+    });
+    expect(
+      applyTrailingPolicyViolation(
+        { ...completed, status: 'stopped', stopReason: 'user_paused' },
+        {
+          allowed: false,
+          reason: 'origin_denied',
+          method: 'GET',
+          origin: 'https://identity.invalid',
+          resourceType: 'document',
+        },
+      ),
+    ).toMatchObject({ status: 'stopped', stopReason: 'origin_denied' });
+  });
+
+  it('rejects live collection until the signed-in session is validated', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'arena-runtime-live-gate-'));
+    let controller: ArenaRuntimeController | null = null;
+    try {
+      const baselinePath = resolve(
+        'packages',
+        'gray-swan-adapter',
+        'contracts',
+        'grayswan.fixture-v1.json',
+      );
+      const contract = JSON.parse(readFileSync(baselinePath, 'utf8')) as {
+        compatibility: { status: string };
+      };
+      contract.compatibility.status = 'verified';
+      const contractPath = join(directory, 'verified-contract.json');
+      writeFileSync(contractPath, JSON.stringify(contract), 'utf8');
+
+      const config = loadRuntimeConfig(
+        {
+          NODE_ENV: 'test',
+          ARENA_DATA_DIR: join(directory, 'data'),
+          ARENA_RUNTIME_STATE_DIR: join(directory, 'runtime-state'),
+          ARENA_BROWSER_PROFILE: join(directory, 'browser-profile'),
+          ARENA_RUNTIME_PORT: '4317',
+          ARENA_LIVE_COLLECTION: 'true',
+          ARENA_INDEX_URL: 'https://app.grayswan.invalid/archive',
+          ARENA_SELECTOR_CONTRACT: contractPath,
+        },
+        resolve('.'),
+      );
+      controller = await ArenaRuntimeController.create(config);
+
+      await expect(
+        controller.startSync({ maxRecords: 1, source: 'live' }),
+      ).rejects.toMatchObject({ code: 'SESSION_NOT_VALID' });
+      expect((await controller.status()).run).toBeNull();
+    } finally {
+      if (controller) await controller.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 20,
+      });
+    }
+  });
+
+  it('classifies archive persistence failures as failed ledger outcomes', () => {
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'archive_failed',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: ['COMMIT'],
+      }),
+    ).toEqual({ status: 'failed', terminalPhase: 'failed' });
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'user_paused',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: [],
+      }),
+    ).toEqual({ status: 'stopped', terminalPhase: 'cancelled' });
+    expect(
+      classifyWorkerSettlement({
+        status: 'stopped',
+        stopReason: 'runtime_shutdown',
+        committed: 0,
+        skippedKnown: 0,
+        visitedStates: [],
+      }),
+    ).toEqual({ status: 'stopped', terminalPhase: 'cancelled' });
+  });
+
   it('uses the registered connector and completes the durable action ledger', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'arena-runtime-demo-'));
     let controller: ArenaRuntimeController | null = null;
@@ -50,9 +201,23 @@ describe('offline runtime lifecycle', () => {
       const actionId = status.run?.actionId;
       if (!actionId) throw new Error('action id missing');
       const detail = controller.readAction(actionId) as {
+        authorization: {
+          actionId: string;
+          connectorId: string;
+          source: string;
+          authorizationHash: string;
+        };
         events: Array<{ phase: string }>;
         recordCommits: Array<{ actionId: string; recordId: string }>;
       };
+      expect(detail.authorization).toEqual(
+        expect.objectContaining({
+          actionId,
+          connectorId: 'gray-swan',
+          source: 'loopback_http_policy',
+          authorizationHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        }),
+      );
       expect(detail.events.map((event) => event.phase)).toEqual([
         'proposal',
         'validation',
@@ -67,6 +232,25 @@ describe('offline runtime lifecycle', () => {
         detail.recordCommits.every((commit) => commit.actionId === actionId),
       ).toBe(true);
       expect(controller.queryRecords({ limit: 10 }).items).toHaveLength(2);
+
+      await controller.startSync({ maxRecords: 2, source: 'demo' });
+      let replay = await controller.status();
+      for (
+        let attempt = 0;
+        attempt < 100 && replay.run?.state === 'running';
+        attempt += 1
+      ) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+        replay = await controller.status();
+      }
+      expect(replay.run).toEqual(
+        expect.objectContaining({
+          state: 'completed',
+          actionPhase: 'canonical_commit',
+          committed: 0,
+          skippedKnown: 2,
+        }),
+      );
     } finally {
       if (controller) await controller.close();
       rmSync(directory, {

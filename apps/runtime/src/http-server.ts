@@ -180,19 +180,23 @@ function safeError(error: unknown): {
   const status =
     code === 'NOT_FOUND'
       ? 404
-      : code === 'CONFLICT' || code === 'STALE_QUERY_CURSOR'
+      : code === 'CONFLICT' ||
+          code === 'SESSION_NOT_VALID' ||
+          code === 'STALE_QUERY_CURSOR'
         ? 409
-        : code === 'INVALID_CURSOR' || code === 'QUERY_CURSOR_MISMATCH'
-          ? 400
-          : code === 'CREDENTIAL_REQUIRED'
+        : code === 'BROWSER_PROFILE_IN_USE'
+          ? 409
+          : code === 'INVALID_CURSOR' || code === 'QUERY_CURSOR_MISMATCH'
             ? 400
-            : code === 'NVIDIA_MODEL_NOT_IN_CATALOG'
+            : code === 'CREDENTIAL_REQUIRED'
               ? 400
-              : code === 'NVIDIA_CATALOG_REQUIRED'
-                ? 409
-                : code === 'NVIDIA_CATALOG_FAILED'
-                  ? 502
-                  : 500;
+              : code === 'NVIDIA_MODEL_NOT_IN_CATALOG'
+                ? 400
+                : code === 'NVIDIA_CATALOG_REQUIRED'
+                  ? 409
+                  : code === 'NVIDIA_CATALOG_FAILED'
+                    ? 502
+                    : 500;
   return {
     status,
     body: redactSecrets({ code, message }) as Record<string, unknown>,

@@ -4,7 +4,10 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 
 import { loadSelectorContract } from '../../gray-swan-adapter/src/contract.js';
-import type { RawPageSnapshot } from '../../gray-swan-adapter/src/types.js';
+import type {
+  IndexPreparationPlan,
+  RawPageSnapshot,
+} from '../../gray-swan-adapter/src/types.js';
 import { createSanitizedEvidence } from '../src/evidence.js';
 import { MemoryArchive } from '../src/memory-archive.js';
 import { CollectNetworkPolicy } from '../src/network-policy.js';
@@ -118,6 +121,17 @@ void test('network policy allows reads and fails closed on writes', () => {
     postData: '{}',
   });
   assert.equal(unknownPost.allowed, false);
+  if (!unknownPost.allowed)
+    assert.equal(unknownPost.endpointPath, '/api/events');
+  const staticOriginPost = policy.decide({
+    url: 'https://static.fixture.invalid/telemetry',
+    method: 'POST',
+    resourceType: 'fetch',
+    postData: '{}',
+  });
+  assert.equal(staticOriginPost.allowed, false);
+  if (!staticOriginPost.allowed)
+    assert.equal(staticOriginPost.endpointPath, undefined);
   const methodOverride = policy.decide({
     url: 'https://fixture.invalid/archive?_method=DELETE',
     method: 'GET',
@@ -237,6 +251,50 @@ void test('checkpoint never advances when commit fails', async () => {
   assert.equal(durableState.checkpoint, null);
 });
 
+void test('unchanged atomic commits do not inflate the reconciled commit count', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  let commitCalls = 0;
+  const committedEvents: string[] = [];
+  const archive: ArchivePort = {
+    hasRecord: async () => false,
+    commitRecord: async (input) => {
+      commitCalls += 1;
+      return {
+        committed: false,
+        canonicalRecordId: `${input.record.kind}:${input.record.externalId}`,
+      };
+    },
+  };
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser: await fixtureBrowser(),
+      archive,
+      selectorContract: contract,
+      now: fixedNow,
+      audit: {
+        write: (event) => {
+          if (event.type === 'record_committed' && event.externalId) {
+            committedEvents.push(event.externalId);
+          }
+        },
+      },
+    },
+  );
+
+  const result = await worker.runNextBatch({ maxRecords: 1 });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.committed, 0);
+  assert.equal(result.skippedKnown, 2);
+  assert.equal(commitCalls, 2);
+  assert.deepEqual(committedEvents, []);
+});
+
 void test('AbortSignal cooperatively pauses an active batch during cooldown', async () => {
   const contract = await loadSelectorContract(
     resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
@@ -269,6 +327,34 @@ void test('AbortSignal cooperatively pauses an active batch during cooldown', as
   assert.equal(archive.records.size, 1);
   assert.equal(archive.checkpoints.length, 1);
   assert.equal(result.visitedStates.at(-1), 'COOLDOWN');
+});
+
+void test('a runtime shutdown abort keeps its durable cancellation reason', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  const controller = new AbortController();
+  controller.abort(new Error('runtime_shutdown'));
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser: await fixtureBrowser(),
+      archive: new MemoryArchive(),
+      selectorContract: contract,
+      now: fixedNow,
+    },
+  );
+
+  const result = await worker.runNextBatch({
+    maxRecords: 1,
+    signal: controller.signal,
+  });
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.stopReason, 'runtime_shutdown');
+  assert.equal(result.committed, 0);
 });
 
 void test('login fixture pauses at AUTH_CHECK', async () => {
@@ -338,6 +424,121 @@ void test('a denied write stops before any snapshot is parsed', async () => {
   const result = await worker.runNextBatch({ maxRecords: 1 });
   assert.equal(result.stopReason, 'unexpected_mutation');
   assert.deepEqual(result.visitedStates, ['AUTH_CHECK']);
+});
+
+void test('a denial arriving during validation is consumed synchronously before commit', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  const fixturePort = await fixtureBrowser();
+  const violation: NetworkPolicyDecision = {
+    allowed: false,
+    reason: 'graphql_endpoint_denied',
+    method: 'POST',
+    origin: 'https://fixture.invalid',
+    resourceType: 'fetch',
+    endpointPath: '/api/unknown',
+  };
+  let pending: NetworkPolicyDecision | null = null;
+  let commitCalls = 0;
+  const browser: CollectBrowserPort = {
+    mode: 'COLLECT_MODE',
+    runtimeKind: 'offline_fixture',
+    primaryOrigin: fixturePort.primaryOrigin,
+    navigate: (url) => fixturePort.navigate(url),
+    snapshot: () => fixturePort.snapshot(),
+    consumePolicyViolation: () => {
+      const decision = pending;
+      pending = null;
+      return decision;
+    },
+    close: () => fixturePort.close(),
+  };
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser,
+      archive: {
+        hasRecord: async () => false,
+        commitRecord: async () => {
+          commitCalls += 1;
+          throw new Error('commit must not run after a policy denial');
+        },
+      },
+      selectorContract: contract,
+      now: fixedNow,
+      audit: {
+        write: (event) => {
+          if (event.type === 'state' && event.state === 'VALIDATE') {
+            pending = violation;
+          }
+        },
+      },
+    },
+  );
+
+  const result = await worker.runNextBatch({ maxRecords: 1 });
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.stopReason, 'unexpected_mutation');
+  assert.equal(commitCalls, 0);
+  assert.equal(result.visitedStates.at(-1), 'COMMIT');
+});
+
+void test('a denial arriving at record-commit audit cannot become a completed run', async () => {
+  const contract = await loadSelectorContract(
+    resolve(adapterRoot, 'contracts/grayswan.fixture-v1.json'),
+  );
+  const fixturePort = await fixtureBrowser();
+  const archive = new MemoryArchive();
+  const violation: NetworkPolicyDecision = {
+    allowed: false,
+    reason: 'graphql_operation_denied',
+    method: 'POST',
+    origin: 'https://fixture.invalid',
+    resourceType: 'fetch',
+    endpointPath: '/graphql',
+  };
+  let pending: NetworkPolicyDecision | null = null;
+  const browser: CollectBrowserPort = {
+    mode: 'COLLECT_MODE',
+    runtimeKind: 'offline_fixture',
+    primaryOrigin: fixturePort.primaryOrigin,
+    navigate: (url) => fixturePort.navigate(url),
+    snapshot: () => fixturePort.snapshot(),
+    consumePolicyViolation: () => {
+      const decision = pending;
+      pending = null;
+      return decision;
+    },
+    close: () => fixturePort.close(),
+  };
+  const worker = new GraySwanBrowserWorker(
+    {
+      indexUrl: 'https://fixture.invalid/arena/archive',
+      minRecordOpenIntervalMs: 0,
+    },
+    {
+      browser,
+      archive,
+      selectorContract: contract,
+      now: fixedNow,
+      audit: {
+        write: (event) => {
+          if (event.type === 'record_committed') pending = violation;
+        },
+      },
+    },
+  );
+
+  const result = await worker.runNextBatch({ maxRecords: 1 });
+  assert.equal(result.status, 'stopped');
+  assert.equal(result.stopReason, 'unexpected_mutation');
+  assert.equal(result.committed, 1);
+  assert.equal(archive.records.size, 1);
+  assert.equal(result.visitedStates.at(-1), 'COMMIT');
 });
 
 void test('fixture-baseline contracts cannot be attached to a live browser', async () => {
@@ -509,6 +710,463 @@ void test('playwright-core launches visible system Chrome by default', async () 
     'waitForClose',
   ]);
   await auth.close();
+});
+
+void test('live index preparation only activates the two reviewed read-only controls', async () => {
+  const clickOrder: string[] = [];
+  const installedScripts: string[] = [];
+  const abortedRequests: string[] = [];
+  let historyOpen = false;
+  let chatsSelected = false;
+  let dispatchRequest:
+    | ((url: string, method: string, postData?: string) => Promise<void>)
+    | undefined;
+
+  function control(
+    label: string,
+    activate: () => void,
+    options: { type?: string | null; formOwned?: boolean } = {},
+  ) {
+    const attributes = new Map<string, string>();
+    if (options.type !== null) {
+      attributes.set('type', options.type ?? 'button');
+    }
+    let formOwned = options.formOwned ?? false;
+    let detached = false;
+    let afterNextRead: (() => void) | null = null;
+    const element = {
+      tagName: 'BUTTON',
+      innerText: label,
+      get form() {
+        return formOwned ? {} : null;
+      },
+      getAttribute: (name: string) => attributes.get(name) ?? null,
+      setAttribute: (name: string, value: string) =>
+        attributes.set(name, value),
+      removeAttribute: (name: string) => attributes.delete(name),
+    };
+    const result = {
+      all: async () => [result],
+      elementHandles: async () => [result],
+      click: async () => {
+        if (detached) throw new Error('Element is not attached to the DOM');
+        assert.ok(
+          attributes.get('data-arena-archivist-readonly-action'),
+          'reviewed controls require an ephemeral action token',
+        );
+        clickOrder.push(label);
+        activate();
+      },
+      evaluate: async (
+        pageFunction: (target: typeof element, argument?: unknown) => unknown,
+        argument?: unknown,
+      ) => {
+        if (detached) throw new Error('Element is not attached to the DOM');
+        return pageFunction(element, argument);
+      },
+      innerText: async () => {
+        if (detached) throw new Error('Element is not attached to the DOM');
+        const afterRead = afterNextRead;
+        afterNextRead = null;
+        afterRead?.();
+        return label;
+      },
+      dispose: async () => undefined,
+      marker: () =>
+        attributes.get('data-arena-archivist-readonly-action') ?? null,
+      setType: (type: string | null) => {
+        if (type === null) attributes.delete('type');
+        else attributes.set('type', type);
+      },
+      setFormOwned: (value: boolean) => {
+        formOwned = value;
+      },
+      detachAfterNextRead: (afterDetach: () => void) => {
+        afterNextRead = () => {
+          detached = true;
+          afterDetach();
+        };
+      },
+    };
+    return result;
+  }
+
+  const historyControl = control('Chats 3793', () => {
+    historyOpen = true;
+  });
+  const chatTabControl = control(
+    'Chats (3793)',
+    () => {
+      chatsSelected = true;
+    },
+    { type: null, formOwned: false },
+  );
+  const submitControl = control('Submit Break', () => {
+    throw new Error('a replacement submit control must never be clicked');
+  });
+  let currentHistoryControl = historyControl;
+  const readyLink = control('Synthetic chat', () => {});
+  const emptyLocator = {
+    ...control('', () => {}),
+    all: async () => [],
+    elementHandles: async () => [],
+  };
+  const page = {
+    url: () => 'https://app.grayswan.invalid/arena/challenge/test',
+    goto: async () => ({ status: () => 200 }),
+    content: async () => '<main>fixture</main>',
+    title: async () => 'Fixture',
+    locator: (selector: string) => {
+      if (selector === 'body') {
+        return { ...emptyLocator, innerText: async () => 'fixture' };
+      }
+      if (selector === 'button[type=button]') {
+        return {
+          ...emptyLocator,
+          all: async () => [currentHistoryControl],
+          elementHandles: async () => [currentHistoryControl],
+        };
+      }
+      if (selector === 'div[role=dialog] button') {
+        return {
+          ...emptyLocator,
+          all: async () => (historyOpen ? [chatTabControl] : []),
+          elementHandles: async () => (historyOpen ? [chatTabControl] : []),
+        };
+      }
+      if (selector === 'div[role=dialog] a[href*="chatId="]') {
+        return {
+          ...emptyLocator,
+          all: async () => (chatsSelected ? [readyLink] : []),
+          elementHandles: async () => (chatsSelected ? [readyLink] : []),
+        };
+      }
+      if (
+        [
+          'button[data-behavior-id][class*="bg-secondary"]',
+          'div[data-testid="userMessage"]',
+          'div[data-testid="assistantMessage"]',
+        ].includes(selector)
+      ) {
+        return {
+          ...emptyLocator,
+          all: async () => [readyLink],
+          elementHandles: async () => [readyLink],
+        };
+      }
+      return emptyLocator;
+    },
+    close: async () => {},
+  };
+  const context = {
+    pages: () => [],
+    newPage: async () => page,
+    addInitScript: async (script: string) => installedScripts.push(script),
+    route: async (
+      _pattern: string,
+      handler: (route: {
+        request(): {
+          url(): string;
+          method(): string;
+          resourceType(): string;
+          postData(): string | null;
+          headers(): Record<string, string>;
+        };
+        abort(errorCode?: string): Promise<void>;
+        continue(): Promise<void>;
+      }) => Promise<void>,
+    ) => {
+      dispatchRequest = async (url, method, postData = '{}') =>
+        handler({
+          request: () => ({
+            url: () => url,
+            method: () => method,
+            resourceType: () => 'fetch',
+            postData: () => postData,
+            headers: () => ({}),
+          }),
+          abort: async () => {
+            abortedRequests.push(url);
+          },
+          continue: async () => undefined,
+        });
+    },
+    on: () => {},
+    close: async () => {},
+  };
+  const runtime = {
+    chromium: { launchPersistentContext: async () => context },
+  } as unknown as PlaywrightRuntimeLike;
+  const browser = await openCollectBrowser(runtime, {
+    profileDirectory: 'D:/ArenaArchivist/runtime/chrome-profile',
+    primaryOrigin: 'https://app.grayswan.invalid',
+  });
+  const plan: IndexPreparationPlan = {
+    steps: [
+      {
+        intent: 'open_history_panel',
+        selector: 'button[type=button]',
+        expectedTextPattern: '^Chats\\s+\\d+$',
+      },
+      {
+        intent: 'select_chat_tab',
+        selector: 'div[role=dialog] button',
+        expectedTextPattern: '^Chats\\s+\\(\\d+\\)$',
+      },
+    ],
+    readySelector: 'div[role=dialog] a[href*="chatId="]',
+    timeoutMs: 500,
+  };
+
+  await browser.prepareIndex?.(plan);
+  await browser.waitForRecordReady?.('chat');
+  assert.deepEqual(clickOrder, ['Chats 3793', 'Chats (3793)']);
+  assert.equal(historyControl.marker(), null);
+  assert.equal(chatTabControl.marker(), null);
+  assert.match(installedScripts[0] ?? '', /event\.isTrusted/);
+  assert.doesNotMatch(
+    installedScripts[0] ?? '',
+    /__ARENA_ARCHIVIST_READONLY_TOKEN__/,
+  );
+  assert.ok(dispatchRequest);
+  await dispatchRequest('https://telemetry.invalid/event', 'POST');
+  assert.equal(browser.consumePolicyViolation(), null);
+  await dispatchRequest('https://app.grayswan.invalid/ingest/flags/', 'POST');
+  assert.equal(browser.consumePolicyViolation(), null);
+  for (const endpointPath of [
+    '/ingest/flags',
+    '/ingest/e/',
+    '/ingest/archive/',
+  ]) {
+    await dispatchRequest(
+      `https://app.grayswan.invalid${endpointPath}`,
+      'POST',
+    );
+    const ingestViolation = browser.consumePolicyViolation();
+    assert.equal(ingestViolation?.allowed, false);
+    if (ingestViolation && !ingestViolation.allowed) {
+      assert.equal(ingestViolation.endpointPath, endpointPath);
+    }
+  }
+  await dispatchRequest('https://app.grayswan.invalid/api/unknown', 'POST');
+  const primaryViolation = browser.consumePolicyViolation();
+  assert.equal(primaryViolation?.allowed, false);
+  if (primaryViolation && !primaryViolation.allowed) {
+    assert.equal(primaryViolation.reason, 'graphql_endpoint_denied');
+    assert.equal(primaryViolation.endpointPath, '/api/unknown');
+  }
+  assert.equal(abortedRequests.length, 6);
+
+  historyControl.setType(null);
+  historyControl.setFormOwned(true);
+  await assert.rejects(
+    () => browser.prepareIndex?.(plan) ?? Promise.resolve(),
+    /Read-only index transition denied/,
+  );
+  historyControl.setFormOwned(false);
+  historyControl.setType('SUBMIT');
+  await assert.rejects(
+    () => browser.prepareIndex?.(plan) ?? Promise.resolve(),
+    /Read-only index transition denied/,
+  );
+  historyControl.setType('button');
+  historyControl.detachAfterNextRead(() => {
+    currentHistoryControl = submitControl;
+  });
+  await assert.rejects(
+    () => browser.prepareIndex?.(plan) ?? Promise.resolve(),
+    /not attached/i,
+  );
+  assert.equal(
+    clickOrder.filter((label) => label === 'Submit Break').length,
+    0,
+  );
+  await assert.rejects(
+    () =>
+      browser.prepareIndex?.({
+        ...plan,
+        steps: [
+          {
+            intent: 'open_history_panel',
+            selector: 'button[type=submit]',
+            expectedTextPattern: '^Submit Break$',
+          },
+          plan.steps[1]!,
+        ],
+      }) ?? Promise.resolve(),
+    /Unreviewed read-only index preparation plan/,
+  );
+  await browser.close();
+});
+
+void test('collection launch releases its profile when initialization fails', async () => {
+  const initializationError = new Error('route setup failed');
+  let closeCalls = 0;
+  const page = {
+    url: () => 'about:blank',
+    goto: async () => null,
+    content: async () => '<body></body>',
+    title: async () => '',
+    locator: () => ({ innerText: async () => '' }),
+    close: async () => undefined,
+  };
+  const context = {
+    pages: () => [],
+    newPage: async () => page,
+    addInitScript: async () => undefined,
+    route: async () => {
+      throw initializationError;
+    },
+    on: () => undefined,
+    close: async () => {
+      closeCalls += 1;
+      throw new Error('cleanup failure must not replace initialization error');
+    },
+  };
+  const runtime = {
+    chromium: { launchPersistentContext: async () => context },
+  } as unknown as PlaywrightRuntimeLike;
+
+  await assert.rejects(
+    () =>
+      openCollectBrowser(runtime, {
+        profileDirectory: 'D:/ArenaArchivist/runtime/chrome-profile',
+        primaryOrigin: 'https://app.grayswan.invalid',
+      }),
+    (error) => error === initializationError,
+  );
+  assert.equal(closeCalls, 1);
+});
+
+void test('startup third-party denials cannot hide a later primary denial', async () => {
+  let closeCalls = 0;
+  const page = {
+    url: () => 'about:blank',
+    goto: async () => null,
+    content: async () => '<body></body>',
+    title: async () => '',
+    locator: () => ({
+      all: async () => [],
+      elementHandles: async () => [],
+      innerText: async () => '',
+    }),
+    close: async () => undefined,
+  };
+  const requestRoute = (url: string) => ({
+    request: () => ({
+      url: () => url,
+      method: () => 'POST',
+      resourceType: () => 'fetch',
+      postData: () => '{}',
+      headers: () => ({}),
+    }),
+    abort: async () => undefined,
+    continue: async () => undefined,
+  });
+  const context = {
+    pages: () => [],
+    newPage: async () => page,
+    addInitScript: async () => undefined,
+    route: async (
+      _pattern: string,
+      handler: (route: ReturnType<typeof requestRoute>) => Promise<void>,
+    ) => {
+      for (let index = 0; index < 40; index += 1) {
+        await handler(requestRoute(`https://telemetry-${index}.invalid/event`));
+      }
+      await handler(requestRoute('https://app.grayswan.invalid/api/unknown'));
+    },
+    on: () => undefined,
+    close: async () => {
+      closeCalls += 1;
+    },
+  };
+  const runtime = {
+    chromium: { launchPersistentContext: async () => context },
+  } as unknown as PlaywrightRuntimeLike;
+
+  await assert.rejects(
+    () =>
+      openCollectBrowser(runtime, {
+        profileDirectory: 'D:/ArenaArchivist/runtime/chrome-profile',
+        primaryOrigin: 'https://app.grayswan.invalid',
+      }),
+    /denied request/,
+  );
+  assert.equal(closeCalls, 1);
+});
+
+void test('collection initialization sweeps a Chromium replacement page', async () => {
+  let replacementCloseCalls = 0;
+  let contextClosed = false;
+  const pages: Array<{
+    url(): string;
+    goto(): Promise<null>;
+    content(): Promise<string>;
+    title(): Promise<string>;
+    locator(): {
+      all(): Promise<never[]>;
+      elementHandles(): Promise<never[]>;
+      innerText(): Promise<string>;
+    };
+    close(): Promise<void>;
+  }> = [];
+  const removePage = (page: (typeof pages)[number]) => {
+    const index = pages.indexOf(page);
+    if (index >= 0) pages.splice(index, 1);
+  };
+  const page = (url: string, onClose?: () => void) => {
+    const value = {
+      url: () => url,
+      goto: async () => null,
+      content: async () => '<body></body>',
+      title: async () => '',
+      locator: () => ({
+        all: async () => [],
+        elementHandles: async () => [],
+        innerText: async () => '',
+      }),
+      close: async () => {
+        removePage(value);
+        onClose?.();
+      },
+    };
+    return value;
+  };
+  const replacement = page('about:blank#replacement', () => {
+    replacementCloseCalls += 1;
+  });
+  const restored = page('https://app.grayswan.invalid/old-tab', () => {
+    pages.push(replacement);
+  });
+  const main = page('about:blank');
+  pages.push(restored);
+  const context = {
+    pages: () => [...pages],
+    newPage: async () => {
+      pages.push(main);
+      return main;
+    },
+    addInitScript: async () => undefined,
+    route: async () => undefined,
+    on: () => undefined,
+    close: async () => {
+      contextClosed = true;
+      pages.splice(0);
+    },
+  };
+  const runtime = {
+    chromium: { launchPersistentContext: async () => context },
+  } as unknown as PlaywrightRuntimeLike;
+
+  const browser = await openCollectBrowser(runtime, {
+    profileDirectory: 'D:/ArenaArchivist/runtime/chrome-profile',
+    primaryOrigin: 'https://app.grayswan.invalid',
+  });
+  assert.equal(replacementCloseCalls, 1);
+  assert.deepEqual(pages, [main]);
+  await browser.close();
+  assert.equal(contextClosed, true);
 });
 
 void test('AUTH_MODE reuses a popup created before the popup event times out', async () => {

@@ -21,13 +21,32 @@ afterEach(async () => {
   );
 });
 
-async function fixtureServer() {
+async function fixtureServer(
+  options: {
+    liveSessionInvalid?: boolean;
+    validationError?: { readonly code: string; readonly message: string };
+  } = {},
+) {
   const calls: string[] = [];
   const controller: RuntimeController = {
     status: () => ({}),
     openAuthBrowser: async () => ({}),
-    validateSession: async () => ({}),
-    startSync: async () => ({}),
+    validateSession: async () => {
+      if (options.validationError) {
+        throw Object.assign(new Error(options.validationError.message), {
+          code: options.validationError.code,
+        });
+      }
+      return {};
+    },
+    startSync: async () => {
+      if (options.liveSessionInvalid) {
+        throw Object.assign(new Error('validate session first'), {
+          code: 'SESSION_NOT_VALID',
+        });
+      }
+      return {};
+    },
     pause: async () => ({}),
     listRecords: (input) => {
       calls.push(`offset:${input.offset}`);
@@ -43,6 +62,11 @@ async function fixtureServer() {
       if (input.cursor === 'invalid') {
         throw Object.assign(new Error('bad cursor'), {
           code: 'INVALID_CURSOR',
+        });
+      }
+      if (input.cursor === 'mismatch') {
+        throw Object.assign(new Error('query changed'), {
+          code: 'QUERY_CURSOR_MISMATCH',
         });
       }
       return {
@@ -123,10 +147,50 @@ describe('runtime archive HTTP boundary', () => {
     expect(await invalid.json()).toEqual(
       expect.objectContaining({ code: 'INVALID_CURSOR' }),
     );
+    const mismatch = await fetch(`${baseUrl}/v1/records/query?cursor=mismatch`);
+    expect(mismatch.status).toBe(400);
+    expect(await mismatch.json()).toEqual(
+      expect.objectContaining({ code: 'QUERY_CURSOR_MISMATCH' }),
+    );
     const stale = await fetch(`${baseUrl}/v1/records/query?cursor=stale`);
     expect(stale.status).toBe(409);
     expect(await stale.json()).toEqual(
       expect.objectContaining({ code: 'STALE_QUERY_CURSOR' }),
     );
+  });
+
+  it('maps an unvalidated live session to a stable conflict response', async () => {
+    const { baseUrl } = await fixtureServer({ liveSessionInvalid: true });
+    const response = await fetch(`${baseUrl}/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ maxRecords: 1, source: 'live' }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual(
+      expect.objectContaining({ code: 'SESSION_NOT_VALID' }),
+    );
+  });
+
+  it('returns a stable sanitized session-validation failure', async () => {
+    const { baseUrl } = await fixtureServer({
+      validationError: {
+        code: 'SESSION_SNAPSHOT_FAILED',
+        message: '无法读取登录状态验证页。请重试。',
+      },
+    });
+    const response = await fetch(`${baseUrl}/v1/session/validate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body).toEqual({
+      code: 'SESSION_SNAPSHOT_FAILED',
+      message: '无法读取登录状态验证页。请重试。',
+    });
+    expect(JSON.stringify(body)).not.toContain('Browser logs');
+    expect(JSON.stringify(body)).not.toContain('browser-profile');
   });
 });

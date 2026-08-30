@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 
 import {
+  assertSelectorContract,
   detectBlockingCondition,
   loadSelectorContract,
   parseIndexSnapshot,
@@ -15,6 +16,44 @@ import type { RawPageSnapshot } from '../src/types.js';
 const packageRoot = resolve('packages/gray-swan-adapter');
 const fixtureRoot = resolve(packageRoot, 'fixtures/html');
 const contractPath = resolve(packageRoot, 'contracts/grayswan.fixture-v1.json');
+const liveContractPath = resolve(
+  packageRoot,
+  'contracts/grayswan.live-v2.json',
+);
+const syntheticLiveChatId = '0123456789abcdef01234567';
+
+interface MutableLiveContract {
+  schemaVersion: number;
+  index: {
+    preparation: {
+      steps: Array<{
+        intent: string;
+        selector: string;
+        expectedTextPattern: string;
+      }>;
+      readySelector: string;
+      timeoutMs: number;
+    };
+    fields: {
+      externalId: {
+        candidates: Array<{
+          source?: string;
+          attribute?: string;
+          queryParam?: string;
+        }>;
+      };
+      kind: {
+        candidates: Array<{ source?: string; value?: string }>;
+      };
+    };
+  };
+}
+
+async function mutableLiveContract(): Promise<MutableLiveContract> {
+  return JSON.parse(
+    await readFile(liveContractPath, 'utf8'),
+  ) as MutableLiveContract;
+}
 
 async function snapshot(
   name: string,
@@ -208,4 +247,187 @@ void test('same-origin hrefs outside the versioned record allowlist fail closed'
   );
   assert.equal(parsed.ok, false);
   if (!parsed.ok) assert.equal(parsed.issues[0]?.code, 'field_invalid');
+});
+
+void test('schema v2 contract validates the fixed, ordered index preparation plan', async () => {
+  const contract = await loadSelectorContract(liveContractPath);
+  assert.equal(contract.schemaVersion, 2);
+  assert.deepEqual(
+    contract.index.preparation?.steps.map((step) => step.intent),
+    ['open_history_panel', 'select_chat_tab'],
+  );
+
+  const mutations: Array<(value: MutableLiveContract) => void> = [
+    (value) => {
+      value.index.preparation.steps.reverse();
+    },
+    (value) => {
+      value.index.preparation.steps[0]!.selector = 'button';
+    },
+    (value) => {
+      value.index.preparation.steps[1]!.expectedTextPattern = '^Chats';
+    },
+    (value) => {
+      value.index.preparation.readySelector = 'a[href]';
+    },
+    (value) => {
+      value.index.preparation.timeoutMs = 0;
+    },
+    (value) => {
+      value.index.preparation.timeoutMs = 30_001;
+    },
+  ];
+  for (const mutate of mutations) {
+    const invalid = await mutableLiveContract();
+    mutate(invalid);
+    assert.throws(() => assertSelectorContract(invalid));
+  }
+});
+
+void test('schema v1 behavior stays unchanged and rejects v2 extraction sources', async () => {
+  const value = JSON.parse(await readFile(contractPath, 'utf8')) as {
+    index: {
+      fields: {
+        kind: {
+          candidates: Array<{
+            id: string;
+            selector: string;
+            source?: string;
+            value?: string;
+          }>;
+        };
+      };
+    };
+  };
+  value.index.fields.kind.candidates[0] = {
+    ...value.index.fields.kind.candidates[0]!,
+    source: 'constant',
+    value: 'chat',
+  };
+  assert.throws(() => assertSelectorContract(value), /text or attribute/);
+});
+
+void test('schema v2 validates constant and URL-query candidate metadata', async () => {
+  const missingConstant = await mutableLiveContract();
+  delete missingConstant.index.fields.kind.candidates[0]!.value;
+  assert.throws(
+    () => assertSelectorContract(missingConstant),
+    /non-empty short string/,
+  );
+
+  const badKind = await mutableLiveContract();
+  badKind.index.fields.kind.candidates[0]!.value = 'unknown';
+  assert.throws(() => assertSelectorContract(badKind), /supported record kind/);
+
+  const missingQueryParam = await mutableLiveContract();
+  delete missingQueryParam.index.fields.externalId.candidates[0]!.queryParam;
+  assert.throws(
+    () => assertSelectorContract(missingQueryParam),
+    /safe query parameter/,
+  );
+});
+
+void test('live v2 index derives one chat id from an href query and uses a constant kind', async () => {
+  const contract = await loadSelectorContract(liveContractPath);
+  const parsed = parseIndexSnapshot(
+    await snapshot(
+      'live-index-v2.html',
+      'https://fixture.invalid/arena/challenge/hazard-hunt-q3',
+      'Synthetic challenge archive',
+    ),
+    contract,
+  );
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.value.records, [
+    {
+      externalId: syntheticLiveChatId,
+      kind: 'chat',
+      href: `/arena/challenge/hazard-hunt-q3?chatId=${syntheticLiveChatId}`,
+      title: 'Synthetic archived chat',
+      updatedAt: null,
+    },
+  ]);
+  assert.ok(
+    parsed.value.trace.some(
+      (entry) => entry.candidateId === 'live.index.chat-kind',
+    ),
+  );
+});
+
+void test('URL-query extraction fails closed for missing, empty, duplicate, or malformed sources', async () => {
+  const contract = await loadSelectorContract(liveContractPath);
+  const invalidHrefs = [
+    '/arena/challenge/hazard-hunt-q3#chatId=',
+    '/arena/challenge/hazard-hunt-q3?chatId=',
+    `/arena/challenge/hazard-hunt-q3?chatId=${syntheticLiveChatId}&chatId=abcdefabcdefabcdefabcdef`,
+    'http://[::1?chatId=abcdefabcdefabcdefabcdef',
+  ];
+
+  for (const href of invalidHrefs) {
+    const parsed = parseIndexSnapshot(
+      {
+        url: 'https://fixture.invalid/arena/challenge/hazard-hunt-q3',
+        title: 'Synthetic challenge archive',
+        html: `<div role="dialog" data-dialog-content><a href="${href}">Synthetic chat</a></div>`,
+        visibleText: 'Synthetic chat',
+        capturedAt: '2026-08-30T00:00:00.000Z',
+      },
+      contract,
+    );
+    assert.equal(parsed.ok, false);
+    if (!parsed.ok) {
+      assert.ok(
+        parsed.issues.some(
+          (issue) =>
+            issue.code === 'field_invalid' &&
+            issue.field === 'index[0].externalId',
+        ),
+        `expected invalid externalId issue for ${href}: ${JSON.stringify(parsed.issues)}`,
+      );
+    }
+  }
+});
+
+void test('data-testid detail parsing keeps comma-union DOM order and selector-fixed roles', async () => {
+  const contract = await loadSelectorContract(liveContractPath);
+  const parsed = parseRecordSnapshot(
+    await snapshot(
+      'live-chat-v2.html',
+      `https://fixture.invalid/arena/challenge/hazard-hunt-q3?chatId=${syntheticLiveChatId}`,
+      'Synthetic archived chat',
+    ),
+    'chat',
+    contract,
+  );
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.externalId, syntheticLiveChatId);
+  assert.equal(parsed.value.title, 'synthetic-hazard-behavior');
+  assert.equal(parsed.value.behavior, 'synthetic-hazard-behavior');
+  assert.equal(
+    parsed.value.modelAlias,
+    'Synthetic local fixture configuration',
+  );
+  assert.deepEqual(
+    parsed.value.messages.map((message) => message.role),
+    ['user', 'assistant', 'user'],
+  );
+  assert.deepEqual(
+    parsed.value.messages.map((message) => message.body),
+    [
+      'Harmless synthetic request one.',
+      'Harmless synthetic response.',
+      'Harmless synthetic request two.',
+    ],
+  );
+  assert.ok(
+    parsed.value.trace.some(
+      (entry) => entry.candidateId === 'live.chat.assistant-role',
+    ),
+  );
+  assert.equal(
+    validateParsedRecord(parsed.value, syntheticLiveChatId).ok,
+    true,
+  );
 });
