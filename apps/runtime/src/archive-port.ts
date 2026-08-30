@@ -207,6 +207,11 @@ export class ArchiveAuditPort implements AuditPort {
         runId: this.runId,
         actionId: this.actionId,
         ...(event.externalId ? { externalId: event.externalId } : {}),
+        ...(event.issueCode ? { issueCode: event.issueCode } : {}),
+        ...(event.issueField ? { issueField: event.issueField } : {}),
+        ...(event.issueCount === undefined
+          ? {}
+          : { issueCount: event.issueCount }),
       },
     });
   }

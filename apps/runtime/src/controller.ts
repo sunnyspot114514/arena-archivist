@@ -75,6 +75,72 @@ class RuntimeError extends Error {
   }
 }
 
+function browserLaunchError(error: unknown): RuntimeError {
+  const detail = error instanceof Error ? error.message : '';
+  const normalizedDetail = detail.replace(/\s+/gu, ' ');
+  const profileIsBusy = [
+    /\bProcessSingleton\b/iu,
+    /\bSingleton(?:Lock|Cookie|Socket)\b/iu,
+    /(?:user data directory|profile directory|browser profile).{0,160}\b(?:already\s+|currently\s+|is\s+)?(?:in use|locked|being used)\b/iu,
+    /\b(?:in use|locked|being used)\b.{0,160}(?:user data directory|profile directory|browser profile)\b/iu,
+  ].some((pattern) => pattern.test(normalizedDetail));
+  return profileIsBusy
+    ? new RuntimeError(
+        'BROWSER_PROFILE_IN_USE',
+        '专用登录浏览器仍在运行。请关闭整个登录浏览器后重试；登录状态会保留。',
+      )
+    : new RuntimeError(
+        'BROWSER_LAUNCH_FAILED',
+        '无法打开专用浏览器。请确认 Microsoft Edge 可用后重试。',
+      );
+}
+
+type SessionValidationBrowserStep =
+  | 'navigate'
+  | 'prepare'
+  | 'snapshot'
+  | 'close';
+
+const SESSION_VALIDATION_BROWSER_FAILURES: Record<
+  SessionValidationBrowserStep,
+  { readonly code: string; readonly message: string }
+> = {
+  navigate: {
+    code: 'SESSION_NAVIGATION_FAILED',
+    message: '无法打开登录状态验证页。请检查网络连接后重试。',
+  },
+  prepare: {
+    code: 'SESSION_INDEX_PREPARATION_FAILED',
+    message: '无法打开只读聊天归档列表。页面结构可能已变化。',
+  },
+  snapshot: {
+    code: 'SESSION_SNAPSHOT_FAILED',
+    message: '无法读取登录状态验证页。请重试。',
+  },
+  close: {
+    code: 'SESSION_BROWSER_CLOSE_FAILED',
+    message: '无法释放专用浏览器。请关闭整个登录浏览器后重试。',
+  },
+};
+
+function sessionValidationBrowserError(
+  step: SessionValidationBrowserStep,
+): RuntimeError {
+  const failure = SESSION_VALIDATION_BROWSER_FAILURES[step];
+  return new RuntimeError(failure.code, failure.message);
+}
+
+async function runSessionValidationBrowserStep<T>(
+  step: Exclude<SessionValidationBrowserStep, 'close'>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch {
+    throw sessionValidationBrowserError(step);
+  }
+}
+
 type ActiveRun = {
   id: string;
   actionId: string;
@@ -229,11 +295,29 @@ export function sessionAfterLiveWorkerResult(
       'http_429',
       'navigation_failed',
       'origin_denied',
+      'unexpected_mutation',
+      'parser_mismatch',
     ].includes(result.stopReason ?? '')
   ) {
     return 'unknown';
   }
   return current;
+}
+
+export function applyTrailingPolicyViolation(
+  result: WorkerRunResult,
+  decision: NetworkPolicyDecision | null,
+): WorkerRunResult {
+  if (!decision || decision.allowed) return result;
+  return {
+    ...result,
+    status: 'stopped',
+    stopReason:
+      decision.reason === 'origin_denied' ||
+      decision.reason === 'cross_origin_document'
+        ? 'origin_denied'
+        : 'unexpected_mutation',
+  };
 }
 
 function runtimeFailureCode(error: unknown): string {
@@ -597,11 +681,16 @@ export class ArenaRuntimeController implements RuntimeController {
         this.#config.browserProfileDirectory,
         launchTarget.profileKey,
       );
-      const session = await this.#browserDependencies.openAuthSession({
-        launchTarget,
-        profileDirectory,
-        startUrl: this.#config.authStartUrl,
-      });
+      let session: ManualAuthSession;
+      try {
+        session = await this.#browserDependencies.openAuthSession({
+          launchTarget,
+          profileDirectory,
+          startUrl: this.#config.authStartUrl,
+        });
+      } catch (error) {
+        throw browserLaunchError(error);
+      }
       this.#authSession = session;
       void session.waitForClose().finally(() => {
         if (this.#authSession === session) this.#authSession = null;
@@ -624,11 +713,28 @@ export class ArenaRuntimeController implements RuntimeController {
       }
       const contract = this.#requireLiveContract();
       const browser = await this.#openLiveBrowser(contract);
-      let nextSession: 'valid' | 'invalid';
+      let nextSession: 'valid' | 'invalid' = 'invalid';
+      let validationFailure: unknown = null;
       try {
-        await browser.navigate(this.#config.liveIndexUrl!);
-        const violation = browser.consumePolicyViolation();
-        const snapshot = await browser.snapshot();
+        await runSessionValidationBrowserStep('navigate', () =>
+          browser.navigate(this.#config.liveIndexUrl!),
+        );
+        if (contract.index.preparation) {
+          if (!browser.prepareIndex) {
+            throw new RuntimeError(
+              'INDEX_PREPARATION_UNAVAILABLE',
+              'The live browser cannot open the reviewed archive index',
+            );
+          }
+          await runSessionValidationBrowserStep('prepare', () =>
+            browser.prepareIndex!(contract.index.preparation!),
+          );
+        }
+        let violation = browser.consumePolicyViolation();
+        const snapshot = await runSessionValidationBrowserStep('snapshot', () =>
+          browser.snapshot(),
+        );
+        violation ??= browser.consumePolicyViolation();
         const blocker = this.#graySwanConnector.detectBlocker(
           snapshot,
           contract,
@@ -638,9 +744,15 @@ export class ArenaRuntimeController implements RuntimeController {
           : this.#graySwanConnector.parseIndex(snapshot, contract);
         nextSession =
           !violation && !blocker && parsed?.ok ? 'valid' : 'invalid';
-      } finally {
-        await browser.close();
+      } catch (error) {
+        validationFailure = error;
       }
+      try {
+        await browser.close();
+      } catch {
+        throw sessionValidationBrowserError('close');
+      }
+      if (validationFailure) throw validationFailure;
       this.#session = nextSession;
       this.#lastValidatedAt = new Date().toISOString();
       return { session: nextSession };
@@ -935,10 +1047,16 @@ export class ArenaRuntimeController implements RuntimeController {
           audit: new ArchiveAuditPort(this.#store, run.id, run.actionId),
         },
       );
-      const result = await worker.runNextBatch({
+      const workerResult = await worker.runNextBatch({
         maxRecords: run.requested,
         signal: run.controller.signal,
       });
+      // No await is allowed between the trailing consume and durable settlement. A fatal route
+      // denial that lands after the worker's final check therefore cannot become canonical_commit.
+      const result = applyTrailingPolicyViolation(
+        workerResult,
+        browser.consumePolicyViolation(),
+      );
       this.#settleRun(run, result);
     } catch (error) {
       const errorCode = runtimeFailureCode(error);
@@ -1088,17 +1206,21 @@ export class ArenaRuntimeController implements RuntimeController {
   ): Promise<CollectBrowserPort> {
     const launchTarget = await this.#resolveBrowserLaunchTarget();
     const primaryOrigin = new URL(this.#config.liveIndexUrl!).origin;
-    return this.#browserDependencies.openCollectSession({
-      launchTarget,
-      profileDirectory: resolve(
-        this.#config.browserProfileDirectory,
-        launchTarget.profileKey,
-      ),
-      primaryOrigin,
-      staticOrigins: this.#config.staticOrigins,
-      readOnlyGraphqlEndpoints: this.#config.readOnlyGraphqlEndpoints,
-      onPolicyDecision: (decision) => this.#recordNetworkDecision(decision),
-    });
+    try {
+      return await this.#browserDependencies.openCollectSession({
+        launchTarget,
+        profileDirectory: resolve(
+          this.#config.browserProfileDirectory,
+          launchTarget.profileKey,
+        ),
+        primaryOrigin,
+        staticOrigins: this.#config.staticOrigins,
+        readOnlyGraphqlEndpoints: this.#config.readOnlyGraphqlEndpoints,
+        onPolicyDecision: (decision) => this.#recordNetworkDecision(decision),
+      });
+    } catch (error) {
+      throw browserLaunchError(error);
+    }
   }
 
   async #resolveBrowserLaunchTarget(): Promise<BrowserLaunchTarget> {
@@ -1118,7 +1240,12 @@ export class ArenaRuntimeController implements RuntimeController {
       reason: decision.reason,
       action: decision.method,
       origin: decision.origin ?? undefined,
-      metadata: { resourceType: decision.resourceType },
+      metadata: {
+        resourceType: decision.resourceType,
+        ...(decision.endpointPath
+          ? { endpointPath: decision.endpointPath }
+          : {}),
+      },
     });
   }
 

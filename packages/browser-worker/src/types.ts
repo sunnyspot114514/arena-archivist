@@ -1,4 +1,5 @@
 import type {
+  IndexPreparationPlan,
   ParsedGraySwanRecord,
   RawPageSnapshot,
   RecordKind,
@@ -46,6 +47,8 @@ export type NetworkPolicyDecision =
       readonly method: string;
       readonly origin: string | null;
       readonly resourceType: string;
+      /** Query/hash-free local endpoint path, only for primary-origin GraphQL denials. */
+      readonly endpointPath?: string;
     };
 
 export interface CollectBrowserPort {
@@ -53,6 +56,11 @@ export interface CollectBrowserPort {
   readonly runtimeKind: 'live_browser' | 'offline_fixture';
   readonly primaryOrigin: string;
   navigate(url: string): Promise<void>;
+  /** Executes the reviewed, connector-owned transition from a challenge page
+   * to its read-only archive index. No generic click or locator escapes. */
+  prepareIndex?(plan: IndexPreparationPlan): Promise<void>;
+  /** Waits for the reviewed read-only record structure to finish hydrating. */
+  waitForRecordReady?(kind: RecordKind): Promise<void>;
   snapshot(): Promise<RawPageSnapshot>;
   consumePolicyViolation(): NetworkPolicyDecision | null;
   close(): Promise<void>;
@@ -112,6 +120,9 @@ export interface WorkerAuditEvent {
   readonly state?: CollectState;
   readonly externalId?: string;
   readonly reason?: string;
+  readonly issueCode?: string;
+  readonly issueField?: string;
+  readonly issueCount?: number;
 }
 
 export interface AuditPort {

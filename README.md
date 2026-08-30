@@ -10,8 +10,8 @@ Arena Archivist 是一个本地优先、权限收窄的个人红队档案运行�
 - 离线 fixture 可完整执行 `proposal → validation → authorization → dispatch → observation → reconciliation → canonical_commit`，无需访问 Gray Swan。
 - Action/Authorization ledger、稳定 keyset cursor、只读 Connector Registry 和确定性 Authorized Model Projection 均已持久化或接入运行路径。
 - NVIDIA Provider 支持本地输入 API Key、读取官方模型目录、模糊搜索模型 ID 和显式切换；远程模型不会因离线演示自动调用。
-- 当前测试基线为 118 个测试全部通过；`typecheck`、`build`、`lint` 和 `secret-scan` 通过。
-- 真实采集默认关闭。仓库不附带假冒真实页面的 selector contract；必须使用经审阅、状态为 `verified` 的 contract 才能启用。
+- 当前测试基线为 138 个测试全部通过；`typecheck`、`build`、`lint` 和 `secret-scan` 通过。
+- 真实采集默认关闭。仓库附带一个范围很窄、经人工授权实机审阅的 `grayswan.live-v2.json`：它只覆盖 2026-08-30 验证过的 `hazard-hunt-q3` challenge 路由和只读 Chat 归档，不代表对 Gray Swan 其他页面的通用支持。
 
 ## 动机
 
@@ -89,16 +89,16 @@ Runtime 会独立执行同样的门控：登录浏览器仍打开或会话尚未
 
 ### 启用真实采集前
 
-由于站点结构和适用条款可能变化，不能把合成 fixture 的 selector 当作真实 selector。启用前需要：
+由于站点结构和适用条款可能变化，不能把合成 fixture 或历史 contract 当作当前页面仍然兼容的证明。启用前需要：
 
 1. 确认你有权读取目标记录，并查看当前适用条款；如有官方导出，优先使用官方导出。
-2. 人工保存少量页面 fixture，删除秘密和无关个人信息。
-3. 基于这些 fixture 创建 selector contract，将兼容状态设为 `verified`，并通过 parser/policy 测试。
+2. 审阅当前页面结构；如需更新 fixture，只保留合成、脱敏后的结构，不提交真实账户内容。
+3. 复核 selector contract 的精确只读转移和字段选择器，将兼容状态设为 `verified`，并通过 parser/policy 测试。
 4. 从 `.env.example` 创建本地 `.env`，设置 `ARENA_LIVE_COLLECTION=true`、`ARENA_INDEX_URL` 和 `ARENA_SELECTOR_CONTRACT`。
 5. 重新启动 Runtime；项目根目录的 `.env` 会在 Runtime 配置构造前加载。
-6. 关闭登录浏览器、验证会话，并手动启动一个小批次。
+6. 关闭整个登录浏览器、验证会话，并手动启动一个小批次。Dashboard 的真实同步每次默认只请求 1 条，且当前 Rate Governor 每日最多允许 3 个真实批次。
 
-任何 403、429、登录页、CAPTCHA、bot challenge、parser drift 或 mutation deny 都会立即停止批次。
+当前 live v2 contract 只会执行两个经审阅、文本严格匹配的只读导航动作：打开 Chats 历史面板并选择 Chats 标签；它随后只打开 challenge 路由中的 Chat 详情并等待确定的消息结构完成水合。它不会点击或填写 Submit Chat、Submit Break、输入框或上传控件。任何 403、429、登录页、CAPTCHA、bot challenge、parser drift、主站未知写请求或 mutation deny 都会立即停止批次并撤销当前会话验证。第三方子资源和站点反向代理的已知 `/ingest/flags/` 可选分析遥测仍会被阻止并记入本地审计，但不会让已经安全解析的只读归档误报失败；其他同源 `/ingest/*` 写请求仍然 fail closed。
 
 ## NVIDIA 模型连接与切换
 
@@ -138,7 +138,8 @@ Cordis: 4.0.1
 ## 已知限制
 
 - 目前只有 Gray Swan connector；没有通用网站采集模式。
-- 仓库只提供合成 fixture baseline，不提供未经现场审阅的 live selector contract。
+- bundled live v2 contract 只覆盖 2026-08-30 实机验证过的 `hazard-hunt-q3` Chat 归档首个可见列表页；submission、profile、分页遍历和其他 challenge 路由仍未审阅。
+- live contract 的配套 fixture 是合成结构，不包含现场账户数据、真实提示词、Cookie、Token 或浏览器状态；页面变更后必须重新审阅，不能仅凭 contract 中的 `verified` 永久信任。
 - 人工登录浏览器在 Runtime 重启后不会恢复进程级“仍打开”指示；重启前应先关闭该浏览器，重启后再验证 Profile 会话。
 - Dashboard 当前以运行总览为主，完整 policy/action ledger 通过 localhost API 和 SQLite 查看。
 - `analyze` 默认是确定性离线分析；不会为了演示自动发送原始档案到远程模型。
@@ -146,7 +147,7 @@ Cordis: 4.0.1
 
 ## Roadmap
 
-- 增加由用户授权、脱敏 fixture 驱动的 live contract 审阅工作流。
+- 将 live contract 审阅流程做成版本化、可重复的本地工具，并继续只提交合成 fixture。
 - 恢复 Runtime 重启后的原生 AUTH_MODE 进程交接状态。
 - 在 Dashboard 增加 action/authorization timeline、policy deny 和 cursor stale 诊断。
 - 在相同只读 Connector 接口下增加经过审阅的官方导出或其他档案来源。

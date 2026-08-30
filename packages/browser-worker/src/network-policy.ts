@@ -51,7 +51,7 @@ function denial(
   request: RequestDescriptor,
   reason: Exclude<NetworkPolicyDecision, { allowed: true }>['reason'],
   origin: string | null,
-): NetworkPolicyDecision {
+): Exclude<NetworkPolicyDecision, { allowed: true }> {
   return {
     allowed: false,
     reason,
@@ -59,6 +59,18 @@ function denial(
     origin,
     resourceType: request.resourceType,
   };
+}
+
+function graphqlDenial(
+  request: RequestDescriptor,
+  reason: 'graphql_endpoint_denied' | 'graphql_operation_denied',
+  url: URL,
+  includeEndpointPath: boolean,
+): NetworkPolicyDecision {
+  const denied = denial(request, reason, url.origin);
+  return includeEndpointPath
+    ? { ...denied, endpointPath: url.pathname }
+    : denied;
 }
 
 function graphqlDocumentIsReadOnly(document: string): boolean {
@@ -175,7 +187,12 @@ export class CollectNetworkPolicy {
     if (method === 'GET' && isGraphqlEndpoint) {
       const query = url.searchParams.get('query');
       if (!query || !graphqlDocumentIsReadOnly(query)) {
-        return denial(request, 'graphql_operation_denied', url.origin);
+        return graphqlDenial(
+          request,
+          'graphql_operation_denied',
+          url,
+          url.origin === this.config.primaryOrigin,
+        );
       }
       return { allowed: true, reason: 'read_only_graphql' };
     }
@@ -184,10 +201,20 @@ export class CollectNetworkPolicy {
     }
     if (method !== 'POST') return denial(request, 'method_denied', url.origin);
     if (!isGraphqlEndpoint) {
-      return denial(request, 'graphql_endpoint_denied', url.origin);
+      return graphqlDenial(
+        request,
+        'graphql_endpoint_denied',
+        url,
+        url.origin === this.config.primaryOrigin,
+      );
     }
     if (!graphqlPayloadIsReadOnly(request.postData)) {
-      return denial(request, 'graphql_operation_denied', url.origin);
+      return graphqlDenial(
+        request,
+        'graphql_operation_denied',
+        url,
+        url.origin === this.config.primaryOrigin,
+      );
     }
     return { allowed: true, reason: 'read_only_graphql' };
   }

@@ -98,6 +98,11 @@ export default function Home() {
   const running = status?.run?.state === 'running';
   const liveFlow = resolveLiveFlowState(status?.browser);
   const source = syncSourceForLiveFlow(liveFlow);
+  const syncBatchSize = source === 'live' ? 1 : 10;
+  const liveRunBudgetExhausted =
+    source === 'live' &&
+    status !== null &&
+    status.budget.runsToday >= status.budget.maxRunsPerDay;
   const runtimeMode = running
     ? status?.run?.source === 'demo'
       ? 'DEMO_MODE'
@@ -277,13 +282,14 @@ export default function Home() {
                     disabled={
                       !reachable ||
                       busy !== null ||
-                      (source === 'live' && liveFlow !== 'ready')
+                      (source === 'live' && liveFlow !== 'ready') ||
+                      liveRunBudgetExhausted
                     }
                     className="bg-command text-command-foreground hover:bg-command/88"
                     onClick={() =>
                       void runAction(
                         'sync',
-                        () => arenaRuntime.sync(10, source),
+                        () => arenaRuntime.sync(syncBatchSize, source),
                         source === 'demo'
                           ? '离线演示批次已启动，不会访问 Gray Swan。'
                           : '只读同步批次已启动。',
@@ -291,7 +297,11 @@ export default function Home() {
                     }
                   >
                     <Play data-icon="inline-start" fill="currentColor" />
-                    {source === 'demo' ? '运行离线演示' : '同步下一批 10 条'}
+                    {source === 'demo'
+                      ? '运行离线演示'
+                      : liveRunBudgetExhausted
+                        ? '今日真实同步额度已用完'
+                        : '只读同步下一条'}
                   </Button>
                 )}
               </div>
@@ -342,7 +352,7 @@ export default function Home() {
                     {[
                       [
                         '本次预算',
-                        String(status?.run?.requested ?? 10),
+                        String(status?.run?.requested ?? syncBatchSize),
                         '条新记录',
                       ],
                       [

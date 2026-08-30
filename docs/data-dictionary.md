@@ -49,6 +49,8 @@ Normal successful phases are `proposal`, `validation`, `authorization`, `dispatc
 
 `sync_record_commits` is written inside each record/checkpoint transaction and is append-only from schema v4 onward. Under schema v5, authorized rows additionally require a same-run, validated authorization binding and are accepted only while that action is in `dispatch`; legacy offset/store compatibility runs may have a null action ID. Reconciliation hashes the ordered non-unchanged link set and refuses `canonical_commit` unless its count equals both `sync_runs.records_committed` and the worker-reported count.
 
+Network `policy_decisions.metadata` may contain `resourceType` and, only for a denied primary-origin GraphQL-shaped endpoint, a query/hash-free `endpointPath`. It never stores request bodies, query strings, response bodies, Cookie or Authorization values. Denied third-party resources and the exact same-origin `/ingest/flags/` telemetry request remain visible here even though their already-aborted requests do not by themselves terminate an otherwise valid read-only run. Other `/ingest/*` paths are fatal.
+
 ## Record policy fields
 
 Every chat or submission stores:

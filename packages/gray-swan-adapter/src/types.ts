@@ -2,13 +2,15 @@ export const RECORD_KINDS = ['chat', 'submission', 'profile'] as const;
 
 export type RecordKind = (typeof RECORD_KINDS)[number];
 
-export type ExtractionSource = 'text' | 'attribute';
+export type ExtractionSource = 'text' | 'attribute' | 'constant' | 'url_query';
 
 export interface SelectorCandidate {
   readonly id: string;
   readonly selector: string;
   readonly source?: ExtractionSource;
   readonly attribute?: string;
+  readonly value?: string;
+  readonly queryParam?: string;
 }
 
 export interface FieldSelector {
@@ -21,10 +23,23 @@ export interface RepeatedFieldSelector {
   readonly fields: Readonly<Record<string, FieldSelector>>;
 }
 
+export interface IndexPreparationStep {
+  readonly intent: 'open_history_panel' | 'select_chat_tab';
+  readonly selector: string;
+  readonly expectedTextPattern: string;
+}
+
+export interface IndexPreparationPlan {
+  readonly steps: readonly IndexPreparationStep[];
+  readonly readySelector: string;
+  readonly timeoutMs: number;
+}
+
 export interface IndexSelectorContract {
   readonly root: readonly SelectorCandidate[];
   readonly item: readonly SelectorCandidate[];
   readonly hrefPatterns: Readonly<Record<RecordKind, string>>;
+  readonly preparation?: IndexPreparationPlan;
   readonly fields: {
     readonly externalId: FieldSelector;
     readonly kind: FieldSelector;
@@ -54,7 +69,7 @@ export interface BlockerSelectorContract {
 }
 
 export interface GraySwanSelectorContract {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
   readonly contractId: string;
   readonly contractVersion: string;
   readonly compatibility: {

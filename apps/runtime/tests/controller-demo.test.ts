@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import {
+  applyTrailingPolicyViolation,
   ArenaRuntimeController,
   classifyWorkerSettlement,
   sessionAfterLiveWorkerResult,
@@ -28,10 +29,58 @@ describe('offline runtime lifecycle', () => {
     ).toBe('unknown');
     expect(
       sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'unexpected_mutation',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'parser_mismatch',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
         status: 'completed',
         stopReason: null,
       }),
     ).toBe('valid');
+  });
+
+  it('turns a trailing primary denial into a stopped worker result', () => {
+    const completed = {
+      status: 'completed' as const,
+      committed: 1,
+      skippedKnown: 0,
+      stopReason: null,
+      visitedStates: ['AUTH_CHECK', 'COMMIT'] as const,
+    };
+    expect(
+      applyTrailingPolicyViolation(completed, {
+        allowed: false,
+        reason: 'graphql_endpoint_denied',
+        method: 'POST',
+        origin: 'https://app.grayswan.invalid',
+        resourceType: 'fetch',
+        endpointPath: '/api/unknown',
+      }),
+    ).toMatchObject({
+      status: 'stopped',
+      stopReason: 'unexpected_mutation',
+      committed: 1,
+    });
+    expect(
+      applyTrailingPolicyViolation(
+        { ...completed, status: 'stopped', stopReason: 'user_paused' },
+        {
+          allowed: false,
+          reason: 'origin_denied',
+          method: 'GET',
+          origin: 'https://identity.invalid',
+          resourceType: 'document',
+        },
+      ),
+    ).toMatchObject({ status: 'stopped', stopReason: 'origin_denied' });
   });
 
   it('rejects live collection until the signed-in session is validated', async () => {

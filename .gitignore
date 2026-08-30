@@ -65,6 +65,12 @@ next-env.d.ts
 /arena-archivist-data/
 /runtime/
 /.arena-runtime/
+# Defense in depth if ARENA_DATA_DIR is explicitly pointed at the repository root.
+/raw/
+/normalized/
+/analysis/
+/exports/
+/checkpoints/
 
 # local agent coordination
 /.merge-coordination/

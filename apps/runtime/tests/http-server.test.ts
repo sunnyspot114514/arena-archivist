@@ -21,12 +21,24 @@ afterEach(async () => {
   );
 });
 
-async function fixtureServer(options: { liveSessionInvalid?: boolean } = {}) {
+async function fixtureServer(
+  options: {
+    liveSessionInvalid?: boolean;
+    validationError?: { readonly code: string; readonly message: string };
+  } = {},
+) {
   const calls: string[] = [];
   const controller: RuntimeController = {
     status: () => ({}),
     openAuthBrowser: async () => ({}),
-    validateSession: async () => ({}),
+    validateSession: async () => {
+      if (options.validationError) {
+        throw Object.assign(new Error(options.validationError.message), {
+          code: options.validationError.code,
+        });
+      }
+      return {};
+    },
     startSync: async () => {
       if (options.liveSessionInvalid) {
         throw Object.assign(new Error('validate session first'), {
@@ -158,5 +170,27 @@ describe('runtime archive HTTP boundary', () => {
     expect(await response.json()).toEqual(
       expect.objectContaining({ code: 'SESSION_NOT_VALID' }),
     );
+  });
+
+  it('returns a stable sanitized session-validation failure', async () => {
+    const { baseUrl } = await fixtureServer({
+      validationError: {
+        code: 'SESSION_SNAPSHOT_FAILED',
+        message: '无法读取登录状态验证页。请重试。',
+      },
+    });
+    const response = await fetch(`${baseUrl}/v1/session/validate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body).toEqual({
+      code: 'SESSION_SNAPSHOT_FAILED',
+      message: '无法读取登录状态验证页。请重试。',
+    });
+    expect(JSON.stringify(body)).not.toContain('Browser logs');
+    expect(JSON.stringify(body)).not.toContain('browser-profile');
   });
 });

@@ -33,7 +33,7 @@
 - `GET /v1/records?limit=&offset=` remains available for older local clients; new clients use `/v1/records/query`.
 - `GraySwanBrowserWorker`, Browser Guardian, Rate Governor, Archive Exporter, Dashboard, localhost API, and dedicated-profile login flow were extended rather than replaced.
 - Schema v4 upgrades v3 databases under one immediate SQLite transaction, logically clears legacy request JSON, and adds separate authorization/link immutability controls. Schema v5 preserves the v4 checksum while validating existing action/run commit links and adding execution binding triggers. Historical v3 actions keep their original append-only authorization event and return no invented v4 authorization row; without that row they may only enter `blocked`, `failed`, or `cancelled`, never dispatch, successfully settle, or commit.
-- Live Gray Swan collection and remote model calls are not required for merge validation; offline fixtures exercise the same controller, connector, ledger, parser, commit, and recovery path.
+- Offline fixtures continue to exercise the same controller, connector, ledger, parser, commit, and recovery path without network access. In addition, a user-authorized read-only validation on 2026-08-30 exercised the bundled route-specific live v2 contract end to end: one Chat record reached `canonical_commit`, then local deterministic analysis and secret-scanned export completed. That validation found and fixed live DOM drift, an invalid ready selector, SPA hydration timing, optional telemetry classification, late policy-violation consumption, and browser-boundary cleanup/error sanitization. No Gray Swan submission or remote model call was made.
 
 ## Verification
 

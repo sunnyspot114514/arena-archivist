@@ -171,11 +171,17 @@ export class GraySwanBrowserWorker {
   private async stop(
     reason: WorkerStopReason,
     counters: RunCounters,
+    diagnostic?: {
+      readonly issueCode?: string;
+      readonly issueField?: string;
+      readonly issueCount?: number;
+    },
   ): Promise<WorkerRunResult> {
     await this.dependencies.audit?.write({
       at: this.now().toISOString(),
       type: 'run_stopped',
       reason,
+      ...diagnostic,
     });
     return this.result('stopped', counters, reason);
   }
@@ -184,6 +190,13 @@ export class GraySwanBrowserWorker {
     counters: RunCounters,
   ): Promise<WorkerRunResult | null> {
     const decision = this.dependencies.browser.consumePolicyViolation();
+    return this.stopForPolicyDecision(decision, counters);
+  }
+
+  private async stopForPolicyDecision(
+    decision: NetworkPolicyDecision | null,
+    counters: RunCounters,
+  ): Promise<WorkerRunResult | null> {
     const reason = policyStopReason(decision);
     if (!reason || !decision || decision.allowed) return null;
     await this.dependencies.audit?.write({
@@ -244,6 +257,24 @@ export class GraySwanBrowserWorker {
     const initialPolicyStop = await this.policyStop(counters);
     if (initialPolicyStop) return initialPolicyStop;
 
+    const preparation = this.dependencies.selectorContract.index.preparation;
+    if (preparation) {
+      if (!this.dependencies.browser.prepareIndex) {
+        return this.stop('navigation_failed', counters);
+      }
+      try {
+        await this.dependencies.browser.prepareIndex(preparation);
+      } catch {
+        if (input.signal?.aborted) {
+          return this.stop(abortStopReason(input.signal), counters);
+        }
+        const policy = await this.policyStop(counters);
+        return policy ?? this.stop('navigation_failed', counters);
+      }
+      const preparationPolicyStop = await this.policyStop(counters);
+      if (preparationPolicyStop) return preparationPolicyStop;
+    }
+
     let indexSnapshot: RawPageSnapshot;
     try {
       indexSnapshot = await this.dependencies.browser.snapshot();
@@ -253,6 +284,8 @@ export class GraySwanBrowserWorker {
       }
       return this.stop('navigation_failed', counters);
     }
+    const indexCapturePolicyStop = await this.policyStop(counters);
+    if (indexCapturePolicyStop) return indexCapturePolicyStop;
     const authBlocker = this.blockingStop(indexSnapshot);
     if (authBlocker) return this.stop(authBlocker, counters);
 
@@ -263,7 +296,14 @@ export class GraySwanBrowserWorker {
       indexSnapshot,
       this.dependencies.selectorContract,
     );
-    if (!parsedIndex.ok) return this.stop('parser_mismatch', counters);
+    if (!parsedIndex.ok) {
+      const first = parsedIndex.issues[0];
+      return this.stop('parser_mismatch', counters, {
+        issueCode: first?.code,
+        issueField: first?.field,
+        issueCount: parsedIndex.issues.length,
+      });
+    }
 
     for (const entry of parsedIndex.value.records) {
       if (input.signal?.aborted) {
@@ -299,6 +339,7 @@ export class GraySwanBrowserWorker {
       }
       try {
         await this.dependencies.browser.navigate(recordUrl);
+        await this.dependencies.browser.waitForRecordReady?.(entry.kind);
       } catch {
         if (input.signal?.aborted) {
           return this.stop(abortStopReason(input.signal), counters);
@@ -335,7 +376,14 @@ export class GraySwanBrowserWorker {
         entry.kind,
         this.dependencies.selectorContract,
       );
-      if (!parsedRecord.ok) return this.stop('parser_mismatch', counters);
+      if (!parsedRecord.ok) {
+        const first = parsedRecord.issues[0];
+        return this.stop('parser_mismatch', counters, {
+          issueCode: first?.code,
+          issueField: first?.field,
+          issueCount: parsedRecord.issues.length,
+        });
+      }
 
       if (!(await this.enter('VALIDATE', input.signal, entry.externalId))) {
         return this.stop(abortStopReason(input.signal), counters);
@@ -348,6 +396,19 @@ export class GraySwanBrowserWorker {
 
       if (!(await this.enter('COMMIT', input.signal, entry.externalId))) {
         return this.stop(abortStopReason(input.signal), counters);
+      }
+      // This check must be synchronous on the no-denial path. The production archive port starts
+      // and completes its SQLite transaction before its async function first yields, so no route
+      // callback can interleave between this consume and the canonical record transaction.
+      const preCommitDecision =
+        this.dependencies.browser.consumePolicyViolation();
+      if (policyStopReason(preCommitDecision)) {
+        const preCommitStop = await this.stopForPolicyDecision(
+          preCommitDecision,
+          counters,
+        );
+        if (preCommitStop) return preCommitStop;
+        return this.stop('unexpected_mutation', counters);
       }
       let commitResult: ArchiveCommitResult;
       try {
@@ -384,14 +445,21 @@ export class GraySwanBrowserWorker {
         counters.skippedKnown += 1;
       }
 
+      const postCommitPolicyStop = await this.policyStop(counters);
+      if (postCommitPolicyStop) return postCommitPolicyStop;
+
       if (!(await this.enter('COOLDOWN', input.signal, entry.externalId))) {
         return this.stop(abortStopReason(input.signal), counters);
       }
       if (!(await this.waitForCooldown(input.signal))) {
         return this.stop(abortStopReason(input.signal), counters);
       }
+      const cooldownPolicyStop = await this.policyStop(counters);
+      if (cooldownPolicyStop) return cooldownPolicyStop;
     }
 
+    const finalPolicyStop = await this.policyStop(counters);
+    if (finalPolicyStop) return finalPolicyStop;
     return this.result('completed', counters, null);
   }
 }

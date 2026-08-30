@@ -23,10 +23,13 @@ The operating-system user account and processes running as that user are inside 
 | Model invents a click, URL, or submit action | The DSH guard exposes five semantic Arena operations only. No Playwright, browser handle, DOM event, shell, web, or filesystem primitive is model-visible. |
 | Parser targets a write control | DOM guard rejects input, textarea, editable controls, uploads, and submit-like actions. |
 | SPA sends a mutation through a read page | Network guard parses GraphQL operations, rejects mutations, and fails closed on unknown state-changing endpoints. |
+| Optional analytics fails and is mistaken for a compromised session | Third-party subresources and the specifically reviewed same-origin `/ingest/flags/` analytics request are still aborted and audited, but are nonfatal. Every other primary-origin write, including other `/ingest/*` paths, and denied document requests remain fatal. Only a query/hash-free endpoint path may enter audit metadata. |
 | Redirect leaks the session to another origin | `COLLECT_MODE` uses exact origin policy and pauses on identity-provider or cross-origin document navigation. |
 | CAPTCHA or anti-bot loop | Challenge markers, HTTP 403/429, login-required states, and mutation denial immediately stop the batch. |
 | Retry storm or unattended crawl | Single concurrency, record interval, run duration, daily budget, explicit manual start, and escalating backoff. No scheduler tool is loaded. |
 | Concurrent auth, validation, or live sync processes reuse one browser Profile | The Controller acquires an exclusive Profile transition before the first await, invalidates any old session, and publishes `valid` only after the validation browser closes successfully. Concurrent live sync fails closed; `login_required` revokes validation. Offline fixture demos do not consume the Profile and may continue independently. |
+| Browser startup/validation failure leaks a profile path or leaves a context alive | Browser-boundary failures map to stable, path-free Runtime error codes. A context created before later initialization failure is closed best-effort; profile-busy classification accepts only strong browser singleton-lock signals. |
+| Selector drift, DOM reorder, or SPA hydration yields a partial/wrong record | The route-scoped live contract uses unique exact-text preparation steps pinned to one `ElementHandle`, revalidates text/button/form state on that same node before click, uses a quoted valid CSS ready selector, and waits at a record-level hydration barrier before snapshot. Detached, missing, ambiguous, or invalid fields terminate without advancing the checkpoint; parser drift also revokes live-session validation. Contract support is explicitly limited to the reviewed route and record kind. |
 | Record commit advances a checkpoint after partial failure | Record/children/artifact references, run counter, and checkpoint advance share one SQLite transaction; newly written unreferenced evidence is compensated. |
 | Run authorization disappears or execution is blindly replayed after restart | Append-only ledger events and a separate append-only authorization row persist request/scope/authorization hashes, connector/policy identity, principal/source/time, and run/action linkage. Legacy run settlement is rejected for an authorized action. Startup atomically settles an unfinished action as failed instead of redispatching. |
 | Caller supplies an unrelated scope hash or commits before dispatch | Scope is recomputed from the canonical request hash, action target, policy, and exact connector identity; a mismatched caller value fails closed. An authorized run cannot enter `commitRecord` until its action is in `dispatch`. |
@@ -65,7 +68,7 @@ The user must review current site terms, access only records they are authorized
 ## Security review checklist
 
 - Run fixture, ledger, projection, connector, cursor, and policy tests before changing adapters or selectors.
-- Run the repository secret scan before committing and the export secret scan before sharing an analysis pack.
+- Review staged/tracked paths and the staged diff for secrets before committing; run `npm run secret-scan` against the local analysis-pack candidates before sharing an export.
 - Confirm dedicated profiles contain no unrelated accounts and remain outside Git/exports.
 - Confirm runtime binding is `127.0.0.1` and the DSH final plugin tree contains only the five Arena tools.
 - Inspect terminal action events and denied policy events after every live batch.
