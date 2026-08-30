@@ -21,13 +21,20 @@ afterEach(async () => {
   );
 });
 
-async function fixtureServer() {
+async function fixtureServer(options: { liveSessionInvalid?: boolean } = {}) {
   const calls: string[] = [];
   const controller: RuntimeController = {
     status: () => ({}),
     openAuthBrowser: async () => ({}),
     validateSession: async () => ({}),
-    startSync: async () => ({}),
+    startSync: async () => {
+      if (options.liveSessionInvalid) {
+        throw Object.assign(new Error('validate session first'), {
+          code: 'SESSION_NOT_VALID',
+        });
+      }
+      return {};
+    },
     pause: async () => ({}),
     listRecords: (input) => {
       calls.push(`offset:${input.offset}`);
@@ -137,6 +144,19 @@ describe('runtime archive HTTP boundary', () => {
     expect(stale.status).toBe(409);
     expect(await stale.json()).toEqual(
       expect.objectContaining({ code: 'STALE_QUERY_CURSOR' }),
+    );
+  });
+
+  it('maps an unvalidated live session to a stable conflict response', async () => {
+    const { baseUrl } = await fixtureServer({ liveSessionInvalid: true });
+    const response = await fetch(`${baseUrl}/v1/sync`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ maxRecords: 1, source: 'live' }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual(
+      expect.objectContaining({ code: 'SESSION_NOT_VALID' }),
     );
   });
 });

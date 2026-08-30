@@ -1,17 +1,86 @@
 import { describe, expect, it } from 'vitest';
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import {
   ArenaRuntimeController,
   classifyWorkerSettlement,
+  sessionAfterLiveWorkerResult,
 } from '../src/controller';
 import { loadRuntimeConfig } from '../src/config';
 import { ArchiveStore } from '../../../packages/archive-store/index';
 
 describe('offline runtime lifecycle', () => {
+  it('revokes a validated session when a live worker loses authentication', () => {
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'login_required',
+      }),
+    ).toBe('invalid');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'stopped',
+        stopReason: 'captcha',
+      }),
+    ).toBe('unknown');
+    expect(
+      sessionAfterLiveWorkerResult('valid', {
+        status: 'completed',
+        stopReason: null,
+      }),
+    ).toBe('valid');
+  });
+
+  it('rejects live collection until the signed-in session is validated', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'arena-runtime-live-gate-'));
+    let controller: ArenaRuntimeController | null = null;
+    try {
+      const baselinePath = resolve(
+        'packages',
+        'gray-swan-adapter',
+        'contracts',
+        'grayswan.fixture-v1.json',
+      );
+      const contract = JSON.parse(readFileSync(baselinePath, 'utf8')) as {
+        compatibility: { status: string };
+      };
+      contract.compatibility.status = 'verified';
+      const contractPath = join(directory, 'verified-contract.json');
+      writeFileSync(contractPath, JSON.stringify(contract), 'utf8');
+
+      const config = loadRuntimeConfig(
+        {
+          NODE_ENV: 'test',
+          ARENA_DATA_DIR: join(directory, 'data'),
+          ARENA_RUNTIME_STATE_DIR: join(directory, 'runtime-state'),
+          ARENA_BROWSER_PROFILE: join(directory, 'browser-profile'),
+          ARENA_RUNTIME_PORT: '4317',
+          ARENA_LIVE_COLLECTION: 'true',
+          ARENA_INDEX_URL: 'https://app.grayswan.invalid/archive',
+          ARENA_SELECTOR_CONTRACT: contractPath,
+        },
+        resolve('.'),
+      );
+      controller = await ArenaRuntimeController.create(config);
+
+      await expect(
+        controller.startSync({ maxRecords: 1, source: 'live' }),
+      ).rejects.toMatchObject({ code: 'SESSION_NOT_VALID' });
+      expect((await controller.status()).run).toBeNull();
+    } finally {
+      if (controller) await controller.close();
+      rmSync(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 20,
+      });
+    }
+  });
+
   it('classifies archive persistence failures as failed ledger outcomes', () => {
     expect(
       classifyWorkerSettlement({

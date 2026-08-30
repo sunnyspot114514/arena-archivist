@@ -86,6 +86,65 @@ type ActiveRun = {
   promise: Promise<void>;
 };
 
+type OpenAuthSessionInput = {
+  launchTarget: BrowserLaunchTarget;
+  profileDirectory: string;
+  startUrl: string;
+};
+
+type OpenCollectSessionInput = {
+  launchTarget: BrowserLaunchTarget;
+  profileDirectory: string;
+  primaryOrigin: string;
+  staticOrigins: readonly string[];
+  readOnlyGraphqlEndpoints: readonly string[];
+  onPolicyDecision: (decision: NetworkPolicyDecision) => void;
+};
+
+export interface RuntimeBrowserDependencies {
+  resolveLaunchTarget(): Promise<BrowserLaunchTarget>;
+  openAuthSession(input: OpenAuthSessionInput): Promise<ManualAuthSession>;
+  openCollectSession(
+    input: OpenCollectSessionInput,
+  ): Promise<CollectBrowserPort>;
+}
+
+const defaultRuntimeBrowserDependencies: RuntimeBrowserDependencies = {
+  resolveLaunchTarget: resolveBrowserLaunchTarget,
+  openAuthSession: async (input) => {
+    if (input.launchTarget.executablePath) {
+      return openNativeAuthBrowser({
+        executablePath: input.launchTarget.executablePath,
+        profileDirectory: input.profileDirectory,
+        startUrl: input.startUrl,
+      });
+    }
+    const { chromium } = await import('playwright-core');
+    return openManualAuthBrowser(
+      { chromium } as unknown as PlaywrightRuntimeLike,
+      {
+        profileDirectory: input.profileDirectory,
+        startUrl: input.startUrl,
+        channel: input.launchTarget.channel,
+      },
+    );
+  },
+  openCollectSession: async (input) => {
+    const { chromium } = await import('playwright-core');
+    return openCollectBrowser(
+      { chromium } as unknown as PlaywrightRuntimeLike,
+      {
+        profileDirectory: input.profileDirectory,
+        primaryOrigin: input.primaryOrigin,
+        staticOrigins: input.staticOrigins,
+        readOnlyGraphqlEndpoints: input.readOnlyGraphqlEndpoints,
+        channel: input.launchTarget.channel,
+        onPolicyDecision: input.onPolicyDecision,
+      },
+    );
+  },
+};
+
 function runSource(run: StoredSyncRun): 'demo' | 'live' {
   return run.metadata.source === 'live' ? 'live' : 'demo';
 }
@@ -150,6 +209,31 @@ export function classifyWorkerSettlement(result: WorkerRunResult): {
         ? 'cancelled'
         : 'blocked',
   };
+}
+
+function requiresClosedAuthBrowser(source: 'demo' | 'live'): boolean {
+  return source === 'live';
+}
+
+export function sessionAfterLiveWorkerResult(
+  current: 'unknown' | 'valid' | 'invalid',
+  result: Pick<WorkerRunResult, 'status' | 'stopReason'>,
+): 'unknown' | 'valid' | 'invalid' {
+  if (result.stopReason === 'login_required') return 'invalid';
+  if (
+    result.status === 'stopped' &&
+    [
+      'captcha',
+      'bot_challenge',
+      'http_403',
+      'http_429',
+      'navigation_failed',
+      'origin_denied',
+    ].includes(result.stopReason ?? '')
+  ) {
+    return 'unknown';
+  }
+  return current;
 }
 
 function runtimeFailureCode(error: unknown): string {
@@ -217,7 +301,9 @@ export class ArenaRuntimeController implements RuntimeController {
   readonly #config: RuntimeConfig;
   readonly #fixtureContract: GraySwanSelectorContract;
   readonly #liveContract: GraySwanSelectorContract | null;
+  readonly #browserDependencies: RuntimeBrowserDependencies;
   #authSession: ManualAuthSession | null = null;
+  #browserTransition: 'opening_auth' | 'validating_session' | null = null;
   #activeRun: ActiveRun | null = null;
   #session: 'unknown' | 'valid' | 'invalid' = 'unknown';
   #lastValidatedAt: string | null = null;
@@ -236,6 +322,7 @@ export class ArenaRuntimeController implements RuntimeController {
     nvidiaBaseUrl: 'https://integrate.api.nvidia.com/v1';
     fixtureContract: GraySwanSelectorContract;
     liveContract: GraySwanSelectorContract | null;
+    browserDependencies: RuntimeBrowserDependencies;
   }) {
     this.#config = options.config;
     this.#store = options.store;
@@ -247,9 +334,13 @@ export class ArenaRuntimeController implements RuntimeController {
     this.#nvidiaBaseUrl = options.nvidiaBaseUrl;
     this.#fixtureContract = options.fixtureContract;
     this.#liveContract = options.liveContract;
+    this.#browserDependencies = options.browserDependencies;
   }
 
-  static async create(config: RuntimeConfig): Promise<ArenaRuntimeController> {
+  static async create(
+    config: RuntimeConfig,
+    browserDependencies: RuntimeBrowserDependencies = defaultRuntimeBrowserDependencies,
+  ): Promise<ArenaRuntimeController> {
     const store = new ArchiveStore({
       databasePath: config.databasePath,
       evidenceDirectory: config.evidenceDirectory,
@@ -336,6 +427,7 @@ export class ArenaRuntimeController implements RuntimeController {
       nvidiaBaseUrl,
       fixtureContract,
       liveContract,
+      browserDependencies,
     });
   }
 
@@ -489,69 +581,71 @@ export class ArenaRuntimeController implements RuntimeController {
     status: 'opened';
     pageCount: number;
   }> {
-    this.#assertIdle();
-    if (this.#authSession) {
-      if (this.#authSession.pageCount() < 3) {
-        await this.#authSession.openLoginPage();
+    const releaseTransition = this.#beginBrowserTransition('opening_auth');
+    try {
+      if (this.#authSession) {
+        if (this.#authSession.pageCount() < 3) {
+          await this.#authSession.openLoginPage();
+        }
+        return {
+          status: 'opened',
+          pageCount: this.#authSession.pageCount(),
+        };
       }
-      return {
-        status: 'opened',
-        pageCount: this.#authSession.pageCount(),
-      };
+      const launchTarget = await this.#resolveBrowserLaunchTarget();
+      const profileDirectory = resolve(
+        this.#config.browserProfileDirectory,
+        launchTarget.profileKey,
+      );
+      const session = await this.#browserDependencies.openAuthSession({
+        launchTarget,
+        profileDirectory,
+        startUrl: this.#config.authStartUrl,
+      });
+      this.#authSession = session;
+      void session.waitForClose().finally(() => {
+        if (this.#authSession === session) this.#authSession = null;
+      });
+      return { status: 'opened', pageCount: session.pageCount() };
+    } finally {
+      releaseTransition();
     }
-    const launchTarget = await this.#resolveBrowserLaunchTarget();
-    const profileDirectory = resolve(
-      this.#config.browserProfileDirectory,
-      launchTarget.profileKey,
-    );
-    const session = launchTarget.executablePath
-      ? await openNativeAuthBrowser({
-          executablePath: launchTarget.executablePath,
-          profileDirectory,
-          startUrl: this.#config.authStartUrl,
-        })
-      : await (async () => {
-          const { chromium } = await import('playwright-core');
-          return openManualAuthBrowser(
-            { chromium } as unknown as PlaywrightRuntimeLike,
-            {
-              profileDirectory,
-              startUrl: this.#config.authStartUrl,
-              ...this.#playwrightLaunchOptions(launchTarget),
-            },
-          );
-        })();
-    this.#authSession = session;
-    void session.waitForClose().finally(() => {
-      if (this.#authSession === session) this.#authSession = null;
-    });
-    return { status: 'opened', pageCount: session.pageCount() };
   }
 
   async validateSession(): Promise<{ session: 'valid' | 'invalid' }> {
-    this.#assertIdle();
-    if (this.#authSession) {
-      throw new RuntimeError(
-        'CONFLICT',
-        'Close the manual auth browser before validation',
-      );
-    }
-    const contract = this.#requireLiveContract();
-    const browser = await this.#openLiveBrowser(contract);
+    const releaseTransition =
+      this.#beginBrowserTransition('validating_session');
     try {
-      await browser.navigate(this.#config.liveIndexUrl!);
-      const violation = browser.consumePolicyViolation();
-      const snapshot = await browser.snapshot();
-      const blocker = this.#graySwanConnector.detectBlocker(snapshot, contract);
-      const parsed = blocker
-        ? null
-        : this.#graySwanConnector.parseIndex(snapshot, contract);
-      this.#session =
-        !violation && !blocker && parsed?.ok ? 'valid' : 'invalid';
+      if (this.#authSession) {
+        throw new RuntimeError(
+          'CONFLICT',
+          'Close the manual auth browser before validation',
+        );
+      }
+      const contract = this.#requireLiveContract();
+      const browser = await this.#openLiveBrowser(contract);
+      let nextSession: 'valid' | 'invalid';
+      try {
+        await browser.navigate(this.#config.liveIndexUrl!);
+        const violation = browser.consumePolicyViolation();
+        const snapshot = await browser.snapshot();
+        const blocker = this.#graySwanConnector.detectBlocker(
+          snapshot,
+          contract,
+        );
+        const parsed = blocker
+          ? null
+          : this.#graySwanConnector.parseIndex(snapshot, contract);
+        nextSession =
+          !violation && !blocker && parsed?.ok ? 'valid' : 'invalid';
+      } finally {
+        await browser.close();
+      }
+      this.#session = nextSession;
       this.#lastValidatedAt = new Date().toISOString();
-      return { session: this.#session };
+      return { session: nextSession };
     } finally {
-      await browser.close();
+      releaseTransition();
     }
   }
 
@@ -560,13 +654,27 @@ export class ArenaRuntimeController implements RuntimeController {
     source: 'demo' | 'live';
   }): Promise<{ run: RuntimeStatus['run'] }> {
     this.#assertIdle();
-    if (this.#authSession) {
+    if (input.source === 'live' && this.#browserTransition) {
+      throw new RuntimeError(
+        'CONFLICT',
+        'A browser profile transition is already active',
+      );
+    }
+    if (this.#authSession && requiresClosedAuthBrowser(input.source)) {
       throw new RuntimeError(
         'CONFLICT',
         'Close the manual auth browser before collection',
       );
     }
-    if (input.source === 'live') this.#requireLiveContract();
+    if (input.source === 'live') {
+      this.#requireLiveContract();
+      if (this.#session !== 'valid') {
+        throw new RuntimeError(
+          'SESSION_NOT_VALID',
+          'Validate the signed-in browser session before live collection',
+        );
+      }
+    }
 
     let runId: string;
     if (input.source === 'live') {
@@ -834,6 +942,7 @@ export class ArenaRuntimeController implements RuntimeController {
       this.#settleRun(run, result);
     } catch (error) {
       const errorCode = runtimeFailureCode(error);
+      if (run.source === 'live') this.#session = 'unknown';
       const current = this.#store.getSyncRun(run.id);
       if (current?.status === 'running') {
         try {
@@ -861,11 +970,41 @@ export class ArenaRuntimeController implements RuntimeController {
         action: 'run_failed',
       });
     } finally {
-      if (browser) await browser.close();
+      if (browser) {
+        try {
+          await browser.close();
+        } catch (error) {
+          // A completed worker result remains canonical, but an uncertain Profile
+          // release must never authorize another live collection attempt.
+          if (run.source === 'live') this.#session = 'unknown';
+          try {
+            this.#store.appendPolicyDecision({
+              id: `decision_${randomUUID()}`,
+              occurredAt: new Date().toISOString(),
+              layer: 'runtime',
+              mode: run.source === 'live' ? 'COLLECT_MODE' : 'DEMO_MODE',
+              allowed: false,
+              reason: 'browser_close_failed',
+              action: 'browser_close',
+              metadata: {
+                runId: run.id,
+                actionId: run.actionId,
+                error: runtimeFailureCode(error),
+              },
+            });
+          } catch {
+            // The run is already terminal. Never turn cleanup telemetry into an
+            // unhandled rejection or partially rewrite its durable outcome.
+          }
+        }
+      }
     }
   }
 
   #settleRun(run: ActiveRun, result: WorkerRunResult): void {
+    if (run.source === 'live') {
+      this.#session = sessionAfterLiveWorkerResult(this.#session, result);
+    }
     const settlement = classifyWorkerSettlement(result);
     this.#store.settleSyncRunAction({
       runId: run.id,
@@ -947,35 +1086,25 @@ export class ArenaRuntimeController implements RuntimeController {
   async #openLiveBrowser(
     _contract: GraySwanSelectorContract,
   ): Promise<CollectBrowserPort> {
-    const { chromium } = await import('playwright-core');
     const launchTarget = await this.#resolveBrowserLaunchTarget();
     const primaryOrigin = new URL(this.#config.liveIndexUrl!).origin;
-    return openCollectBrowser(
-      { chromium } as unknown as PlaywrightRuntimeLike,
-      {
-        profileDirectory: resolve(
-          this.#config.browserProfileDirectory,
-          launchTarget.profileKey,
-        ),
-        primaryOrigin,
-        staticOrigins: this.#config.staticOrigins,
-        readOnlyGraphqlEndpoints: this.#config.readOnlyGraphqlEndpoints,
-        ...this.#playwrightLaunchOptions(launchTarget),
-        onPolicyDecision: (decision) => this.#recordNetworkDecision(decision),
-      },
-    );
+    return this.#browserDependencies.openCollectSession({
+      launchTarget,
+      profileDirectory: resolve(
+        this.#config.browserProfileDirectory,
+        launchTarget.profileKey,
+      ),
+      primaryOrigin,
+      staticOrigins: this.#config.staticOrigins,
+      readOnlyGraphqlEndpoints: this.#config.readOnlyGraphqlEndpoints,
+      onPolicyDecision: (decision) => this.#recordNetworkDecision(decision),
+    });
   }
 
   async #resolveBrowserLaunchTarget(): Promise<BrowserLaunchTarget> {
-    this.#browserLaunchTarget ??= await resolveBrowserLaunchTarget();
+    this.#browserLaunchTarget ??=
+      await this.#browserDependencies.resolveLaunchTarget();
     return this.#browserLaunchTarget;
-  }
-
-  #playwrightLaunchOptions(target: BrowserLaunchTarget): {
-    channel?: string;
-    executablePath?: string;
-  } {
-    return { channel: target.channel };
   }
 
   #recordNetworkDecision(decision: NetworkPolicyDecision): void {
@@ -1016,6 +1145,29 @@ export class ArenaRuntimeController implements RuntimeController {
   #assertOpen(): void {
     if (this.#closed)
       throw new RuntimeError('RUNTIME_CLOSED', 'Runtime is closed');
+  }
+
+  #beginBrowserTransition(
+    transition: 'opening_auth' | 'validating_session',
+  ): () => void {
+    this.#assertIdle();
+    if (this.#browserTransition) {
+      throw new RuntimeError(
+        'CONFLICT',
+        'A browser profile transition is already active',
+      );
+    }
+    this.#browserTransition = transition;
+    this.#session = 'unknown';
+    this.#lastValidatedAt = null;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (this.#browserTransition === transition) {
+        this.#browserTransition = null;
+      }
+    };
   }
 
   #assertIdle(): void {

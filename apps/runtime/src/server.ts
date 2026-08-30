@@ -1,4 +1,7 @@
+import { existsSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
+import { resolve } from 'node:path';
+import { loadEnvFile } from 'node:process';
 
 import { ArenaRuntimeController } from './controller';
 import { loadRuntimeConfig, type RuntimeConfig } from './config';
@@ -33,8 +36,22 @@ export async function startRuntimeServer(
   return { config, controller, server, close };
 }
 
+export function loadProjectEnvironment(path = resolve('.env')): boolean {
+  if (!existsSync(path)) return false;
+  loadEnvFile(path);
+  return true;
+}
+
+export function loadProjectRuntimeConfig(
+  envPath = resolve('.env'),
+  workspaceRoot = resolve('.'),
+): RuntimeConfig {
+  loadProjectEnvironment(envPath);
+  return loadRuntimeConfig(process.env, workspaceRoot);
+}
+
 async function main(): Promise<void> {
-  const runtime = await startRuntimeServer();
+  const runtime = await startRuntimeServer(loadProjectRuntimeConfig());
   const address = runtime.server.address() as AddressInfo;
   process.stdout.write(
     `Arena Runtime listening on http://${address.address}:${address.port}\n`,

@@ -148,7 +148,7 @@ export const arenaRuntime = {
       body: '{}',
     }),
   validateSession: () =>
-    runtimeRequest<{ session: string }>('/v1/session/validate', {
+    runtimeRequest<{ session: 'valid' | 'invalid' }>('/v1/session/validate', {
       method: 'POST',
       body: '{}',
     }),

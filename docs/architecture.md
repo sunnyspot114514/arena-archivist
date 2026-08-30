@@ -35,6 +35,8 @@ The connector registry does not execute a generic browser. Registration runtime-
 - `PAUSED_HUMAN_AUTH`: the idle/handoff state when a session is missing or human action is required.
 - `DEMO_MODE`: runs the same parse, validate, record commit, and ledger path against repository fixtures without contacting Gray Swan.
 
+Live collection requires an explicit `AUTH_MODE → browser closed → session validation → COLLECT_MODE` transition. A Controller-level exclusive transition is acquired before the first asynchronous browser operation; live sync cannot consume the Profile until the validation browser has closed successfully and `valid` is committed. `login_required` revokes the validated state, while browser/challenge failures conservatively return it to `unknown`. The Dashboard applies the same gate, but `DEMO_MODE` remains available during human authentication because it uses repository fixtures and never opens the profile. Runtime startup reads the optional project-root `.env` before constructing configuration.
+
 ## Worker state and durable action state
 
 The existing record worker keeps its deliberately narrow state machine:

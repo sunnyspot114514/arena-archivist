@@ -32,6 +32,7 @@ import {
   type ArchiveQueryPage,
   type ArenaRuntimeStatus,
 } from '@/lib/arena-runtime';
+import { resolveLiveFlowState, syncSourceForLiveFlow } from '@/lib/live-flow';
 
 const navigation = [
   { label: '运行总览', icon: Radar, active: true },
@@ -95,13 +96,10 @@ export default function Home() {
   );
 
   const running = status?.run?.state === 'running';
-  const source: 'demo' | 'live' =
-    status?.browser.liveCollectionEnabled &&
-    status.browser.selectorContract === 'verified'
-      ? 'live'
-      : 'demo';
+  const liveFlow = resolveLiveFlowState(status?.browser);
+  const source = syncSourceForLiveFlow(liveFlow);
   const runtimeMode = running
-    ? source === 'demo'
+    ? status?.run?.source === 'demo'
       ? 'DEMO_MODE'
       : 'COLLECT_MODE'
     : (status?.browser.mode ?? 'PAUSED_HUMAN_AUTH');
@@ -233,6 +231,30 @@ export default function Home() {
                     ? '打开三个登录标签页'
                     : '登录浏览器已打开'}
                 </Button>
+                {liveFlow === 'validate-session' ? (
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    disabled={!reachable || busy !== null || running}
+                    onClick={() =>
+                      void runAction(
+                        'validate',
+                        async () => {
+                          const result = await arenaRuntime.validateSession();
+                          if (result.session !== 'valid') {
+                            throw new Error(
+                              '登录状态无效，请重新打开登录浏览器完成登录。',
+                            );
+                          }
+                        },
+                        '登录状态已验证，可以开始只读同步。',
+                      )
+                    }
+                  >
+                    <ShieldCheck data-icon="inline-start" />
+                    验证登录状态
+                  </Button>
+                ) : null}
                 {running ? (
                   <Button
                     size="lg"
@@ -252,7 +274,11 @@ export default function Home() {
                 ) : (
                   <Button
                     size="lg"
-                    disabled={!reachable || busy !== null}
+                    disabled={
+                      !reachable ||
+                      busy !== null ||
+                      (source === 'live' && liveFlow !== 'ready')
+                    }
                     className="bg-command text-command-foreground hover:bg-command/88"
                     onClick={() =>
                       void runAction(
@@ -292,11 +318,15 @@ export default function Home() {
                   <CardDescription>
                     {running
                       ? `${status?.run?.source === 'demo' ? '离线 fixture' : 'Gray Swan'} · 已提交 ${status?.run?.committed ?? 0} / ${status?.run?.requested ?? 0}`
-                      : reachable
-                        ? source === 'demo'
-                          ? '真实采集默认关闭；可先运行完整离线演示。'
-                          : '等待你确认登录状态并手动开始新批次。'
-                        : '请先启动 localhost Runtime API。'}
+                      : !reachable
+                        ? '请先启动 localhost Runtime API。'
+                        : liveFlow === 'demo'
+                          ? '真实采集尚未配置 verified selector contract；可先运行完整离线演示。'
+                          : liveFlow === 'close-auth-browser'
+                            ? '登录完成后请关闭整个登录浏览器，再验证登录状态。'
+                            : liveFlow === 'validate-session'
+                              ? '请先验证专用浏览器 Profile 中的登录状态。'
+                              : '登录状态已验证，等待你手动开始新批次。'}
                   </CardDescription>
                   <CardAction>
                     <Badge
