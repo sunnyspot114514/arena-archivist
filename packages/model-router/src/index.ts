@@ -24,6 +24,10 @@ export type ModelTask =
   | 'embeddings'
   | 'sampled_cross_check';
 
+export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 60_000;
+export const NVIDIA_MODEL_REQUEST_TIMEOUT_MS = 15 * 60_000;
+export const MAX_MODEL_REQUEST_TIMEOUT_MS = 30 * 60_000;
+
 export type ProviderRoute = {
   id: string;
   provider: string;
@@ -35,6 +39,10 @@ export type ProviderRoute = {
   zeroDataRetention: boolean;
   promptLogging: boolean;
   enabled: boolean;
+  /** Provider response deadline. Slow-model routes can explicitly extend it. */
+  requestTimeoutMs?: number;
+  /** Consume OpenAI-compatible server-sent events instead of one JSON body. */
+  streamResponse?: boolean;
   additionalHeaders?: Readonly<Record<string, string>>;
   additionalBody?: Readonly<Record<string, unknown>>;
 };
@@ -132,6 +140,155 @@ type OpenAiCompatibleResponse = {
   error?: { message?: string };
 };
 
+type OpenAiCompatibleStreamChunk = {
+  id?: string;
+  choices?: Array<{
+    delta?: { content?: unknown; reasoning_content?: unknown };
+  }>;
+  error?: { message?: string };
+};
+
+type ParsedProviderCompletion = {
+  content: string;
+  requestId: string | null;
+};
+
+const MAX_SSE_EVENT_CHARACTERS = 1_000_000;
+
+function providerErrorMessage(payload: unknown): string | null {
+  if (!payload || Array.isArray(payload) || typeof payload !== 'object') {
+    return null;
+  }
+  const error = (payload as { error?: unknown }).error;
+  if (!error || Array.isArray(error) || typeof error !== 'object') return null;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === 'string' && message.trim() ? message : null;
+}
+
+async function readJsonCompletion(
+  response: Response,
+): Promise<ParsedProviderCompletion> {
+  const body = await response.text();
+  if (!body.trim()) {
+    if (!response.ok) {
+      throw new Error(
+        `Provider request failed (${response.status}): empty response`,
+      );
+    }
+    throw new Error('Provider returned an empty response');
+  }
+
+  let payload: OpenAiCompatibleResponse;
+  try {
+    payload = JSON.parse(body) as OpenAiCompatibleResponse;
+  } catch {
+    if (!response.ok) {
+      throw new Error(
+        `Provider request failed (${response.status}): invalid response`,
+      );
+    }
+    throw new Error('Provider returned invalid JSON');
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Provider request failed (${response.status}): ${providerErrorMessage(payload) ?? 'unknown error'}`,
+    );
+  }
+
+  const content = payload.choices?.[0]?.message?.content;
+  if (typeof content !== 'string') {
+    throw new Error('Provider returned no completion content');
+  }
+  return { content, requestId: payload.id ?? null };
+}
+
+function eventData(event: string): string | null {
+  const values = event
+    .split(/\r?\n/u)
+    .filter((line) => line === 'data' || line.startsWith('data:'))
+    .map((line) => (line === 'data' ? '' : line.slice(5).trimStart()));
+  return values.length > 0 ? values.join('\n') : null;
+}
+
+async function readStreamingCompletion(
+  response: Response,
+): Promise<ParsedProviderCompletion> {
+  if (!response.body) throw new Error('Provider returned an empty event stream');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let requestId: string | null = null;
+  let streamDone = false;
+
+  const consumeEvent = (event: string): void => {
+    const data = eventData(event);
+    if (data === null) return;
+    if (data.trim() === '[DONE]') {
+      streamDone = true;
+      return;
+    }
+    let payload: OpenAiCompatibleStreamChunk;
+    try {
+      payload = JSON.parse(data) as OpenAiCompatibleStreamChunk;
+    } catch {
+      throw new Error('Provider returned invalid event-stream JSON');
+    }
+    const streamError = providerErrorMessage(payload);
+    if (streamError) throw new Error(`Provider stream failed: ${streamError}`);
+    if (!requestId && typeof payload.id === 'string') requestId = payload.id;
+    const deltaContent = payload.choices?.[0]?.delta?.content;
+    if (typeof deltaContent === 'string') content += deltaContent;
+  };
+
+  const consumeBufferedEvents = (flush: boolean): void => {
+    let match = /\r?\n\r?\n/u.exec(buffer);
+    while (match) {
+      const event = buffer.slice(0, match.index);
+      if (event.length > MAX_SSE_EVENT_CHARACTERS) {
+        throw new Error('Provider event-stream frame exceeded the safe limit');
+      }
+      consumeEvent(event);
+      buffer = buffer.slice(match.index + match[0].length);
+      if (streamDone) {
+        buffer = '';
+        return;
+      }
+      match = /\r?\n\r?\n/u.exec(buffer);
+    }
+    if (flush && buffer.trim()) {
+      consumeEvent(buffer);
+      buffer = '';
+    }
+    if (buffer.length > MAX_SSE_EVENT_CHARACTERS) {
+      throw new Error('Provider event-stream frame exceeded the safe limit');
+    }
+  };
+
+  try {
+    while (!streamDone) {
+      const next = await reader.read();
+      if (next.done) {
+        buffer += decoder.decode();
+        consumeBufferedEvents(true);
+        break;
+      }
+      buffer += decoder.decode(next.value, { stream: true });
+      consumeBufferedEvents(false);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+
+  if (!streamDone) {
+    throw new Error('Provider event stream ended before [DONE]');
+  }
+  if (!content) throw new Error('Provider returned no completion content');
+  return { content, requestId };
+}
+
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
     for (const child of Object.values(value as Record<string, unknown>)) {
@@ -169,9 +326,25 @@ function snapshotRoute(route: ProviderRoute): ProviderRoute {
     zeroDataRetention,
     promptLogging,
     enabled,
+    requestTimeoutMs,
+    streamResponse,
     additionalHeaders,
     additionalBody,
   } = route;
+  const normalizedRequestTimeoutMs =
+    requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(normalizedRequestTimeoutMs) ||
+    normalizedRequestTimeoutMs < 1 ||
+    normalizedRequestTimeoutMs > MAX_MODEL_REQUEST_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `Model route ${id} requestTimeoutMs must be an integer from 1 to ${MAX_MODEL_REQUEST_TIMEOUT_MS}`,
+    );
+  }
+  if (streamResponse !== undefined && typeof streamResponse !== 'boolean') {
+    throw new Error(`Model route ${id} streamResponse must be a boolean`);
+  }
   return Object.freeze({
     id,
     provider,
@@ -183,6 +356,8 @@ function snapshotRoute(route: ProviderRoute): ProviderRoute {
     zeroDataRetention,
     promptLogging,
     enabled,
+    requestTimeoutMs: normalizedRequestTimeoutMs,
+    streamResponse: streamResponse ?? false,
     ...(additionalHeaders === undefined
       ? {}
       : { additionalHeaders: Object.freeze({ ...additionalHeaders }) }),
@@ -208,6 +383,7 @@ export class ModelRouter {
       'temperature',
       'max_tokens',
       'response_format',
+      'stream',
     ]);
     const routes = options.routes.map(snapshotRoute);
     const routeIds = new Set<string>();
@@ -224,7 +400,11 @@ export class ModelRouter {
         }
       }
       for (const key of Object.keys(route.additionalHeaders ?? {})) {
-        if (['authorization', 'content-type'].includes(key.toLowerCase())) {
+        if (
+          ['accept', 'authorization', 'content-type'].includes(
+            key.toLowerCase(),
+          )
+        ) {
           throw new Error(
             `Model route ${route.id} cannot override protected header: ${key}`,
           );
@@ -272,6 +452,9 @@ export class ModelRouter {
           method: 'POST',
           headers: {
             authorization: `Bearer ${credential}`,
+            accept: route.streamResponse
+              ? 'text/event-stream'
+              : 'application/json',
             'content-type': 'application/json',
             ...route.additionalHeaders,
           },
@@ -285,29 +468,26 @@ export class ModelRouter {
               responseFormat === 'json_object'
                 ? { type: 'json_object' }
                 : undefined,
+            stream: route.streamResponse || undefined,
           }),
-          signal: AbortSignal.timeout(60_000),
+          signal: AbortSignal.timeout(
+            route.requestTimeoutMs ?? DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
+          ),
         },
       );
 
-      const payload = (await response.json()) as OpenAiCompatibleResponse;
-      if (!response.ok) {
-        throw new Error(
-          `Provider request failed (${response.status}): ${payload.error?.message ?? 'unknown error'}`,
-        );
-      }
-
-      const content = payload.choices?.[0]?.message?.content;
-      if (typeof content !== 'string') {
-        throw new Error('Provider returned no completion content');
-      }
+      const completion = route.streamResponse
+        ? response.ok
+          ? await readStreamingCompletion(response)
+          : await readJsonCompletion(response)
+        : await readJsonCompletion(response);
 
       return {
         routeId: route.id,
         provider: route.provider,
         model: route.model,
-        content,
-        requestId: payload.id ?? null,
+        content: completion.content,
+        requestId: completion.requestId,
       };
     });
   }
@@ -355,6 +535,8 @@ export function defaultProviderRoutes(): ProviderRoute[] {
       zeroDataRetention: false,
       promptLogging: true,
       enabled: Boolean(process.env.NVIDIA_API_KEY && process.env.NVIDIA_MODEL),
+      requestTimeoutMs: NVIDIA_MODEL_REQUEST_TIMEOUT_MS,
+      streamResponse: true,
     },
     {
       id: 'openrouter-zdr',

@@ -109,6 +109,8 @@ Dashboard 右上角的“配置 NVIDIA 模型”提供一个本地 Provider 控�
 3. 只能选择目录中真实存在的模型 ID；后续可刷新目录并显式切换。
 4. “断开并清除 Key”只删除本地加密凭据，保留非秘密的模型选择。
 
+`ModelRouter` 库内置的 `nvidia-direct` route 默认超时为 15 分钟，并使用 OpenAI-compatible SSE 流式响应，以兼容 Kimi K3、DeepSeek 等可能需要较长首 token 时间的推理模型；其他 route 保持 60 秒默认值。受信任 route 可在 1 毫秒到 30 分钟范围内显式设置该期限和流式策略。当前 Dashboard/Runtime 只管理 NVIDIA 凭据、模型目录和选择，尚未把远程 completion 接入 `analyze`；离线分析不会因此自动调用模型。
+
 该交互参考了 CC Switch 的 Provider 状态、模型发现和显式切换思路，但没有引入第二套配置或凭据系统。NVIDIA endpoint 固定为 `https://integrate.api.nvidia.com/v1`，防止 Key 被转发到调用方指定地址。
 
 ## 安全模型
